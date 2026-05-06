@@ -5,12 +5,13 @@ import asyncio
 import contextlib
 import logging
 import queue as _queue
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional
 
 import discord
 
 from .audio_source import StreamingOpusAudioSource
+from .config_store import ConfigStore
 from .fish_client import FishConfig, stream_opus_ogg
 from .ogg_demux import OggDemuxer
 from .voice_manager import VoiceManager
@@ -51,12 +52,16 @@ class GuildTTSPipeline:
         fish_cfg: FishConfig,
         voice_manager: VoiceManager,
         loop: asyncio.AbstractEventLoop,
+        config_store: ConfigStore,
         queue_maxsize: int = QUEUE_MAXSIZE_DEFAULT,
     ) -> None:
         self.guild_id = guild_id
+        # Base FishConfig contains static fields (api_key, model, latency, base_url).
+        # voice_id is taken from config_store at job time for live updates.
         self._fish_cfg = fish_cfg
         self._voice_manager = voice_manager
         self._loop = loop
+        self._config_store = config_store
         self._queue: asyncio.Queue[TTSJob] = asyncio.Queue(maxsize=queue_maxsize)
         self._worker: Optional[asyncio.Task] = None
         self._current_task: Optional[asyncio.Task] = None
@@ -119,6 +124,15 @@ class GuildTTSPipeline:
                 "bot is not in the requested voice channel; /join required"
             )
 
+        # Read voice_id at job time so /voice set takes effect for queued
+        # jobs. If voice was cleared between enqueue and now, fail.
+        voice_id = self._config_store.get_voice_id()
+        if not voice_id:
+            raise RuntimeError(
+                "no voice_id configured; owner must run /voice set <id>"
+            )
+        fish_cfg = replace(self._fish_cfg, voice_id=voice_id)
+
         # Thread-safe sync queue: discord.py's player thread reads from it
         # via StreamingOpusAudioSource.read(). Using asyncio.Queue here would
         # require asyncio.run_coroutine_threadsafe in read(), whose orphaned
@@ -131,7 +145,7 @@ class GuildTTSPipeline:
 
         async def producer() -> None:
             try:
-                async for chunk in stream_opus_ogg(job.text, self._fish_cfg):
+                async for chunk in stream_opus_ogg(job.text, fish_cfg):
                     demux.feed(chunk)
                     for pkt in demux.packets():
                         # put() blocks if full, but in async context we need
@@ -177,16 +191,21 @@ class PipelineRegistry:
         fish_cfg: FishConfig,
         voice_manager: VoiceManager,
         loop: asyncio.AbstractEventLoop,
+        config_store: ConfigStore,
     ) -> None:
         self._fish_cfg = fish_cfg
         self._voice_manager = voice_manager
         self._loop = loop
+        self._config_store = config_store
         self._pipelines: dict[int, GuildTTSPipeline] = {}
 
     def get_or_create(self, guild_id: int) -> GuildTTSPipeline:
         p = self._pipelines.get(guild_id)
         if p is None:
-            p = GuildTTSPipeline(guild_id, self._fish_cfg, self._voice_manager, self._loop)
+            p = GuildTTSPipeline(
+                guild_id, self._fish_cfg, self._voice_manager,
+                self._loop, self._config_store,
+            )
             self._pipelines[guild_id] = p
             asyncio.create_task(p.start())
         return p

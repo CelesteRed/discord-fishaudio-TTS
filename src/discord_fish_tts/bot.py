@@ -1,4 +1,22 @@
-"""Bot entry point. Reads env from .env.local and starts the gateway."""
+"""Bot entry point.
+
+Required env (secrets only):
+    DISCORD_TOKEN          — Discord bot token
+    FISH_AUDIO_API_KEY     — Fish Audio API key
+
+Optional env:
+    DATA_DIR=data          — where config.json lives
+    LOG_LEVEL=INFO
+
+Everything else (voice_id, whitelist, etc.) is managed at runtime via
+slash commands. Owner identity is derived from Discord application
+metadata (`bot.application.owner.id`) — no env var required.
+
+Backward compatibility: legacy v1.1 env vars (FISH_VOICE_ID,
+ALLOWED_GUILDS, BOT_OWNER, WHITELIST_PATH) are still read on first
+startup and migrated into the new `data/config.json`. After migration
+they're ignored.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -6,17 +24,17 @@ import logging
 import os
 import sys
 from pathlib import Path
+from typing import Optional
 
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 
 from .commands import TTSCog
+from .config_store import ConfigStore
 from .fish_client import FishConfig
 from .tts_pipeline import PipelineRegistry
-from .validators import parse_int_set
 from .voice_manager import VoiceManager
-from .whitelist import UserWhitelist
 
 log = logging.getLogger(__name__)
 
@@ -28,6 +46,32 @@ def _required(name: str) -> str:
     return val
 
 
+def _migrate_legacy_env(config: ConfigStore, data_dir: Path) -> None:
+    """v1.1 → v1.2 migration. Run once on every startup; idempotent.
+
+    Migrations:
+      - FISH_VOICE_ID env → config.voice_id
+      - data/whitelist.json (legacy v1.1 file) → config.whitelist
+    """
+    legacy_voice = os.environ.get("FISH_VOICE_ID", "").strip()
+    if legacy_voice and config.get_voice_id() is None:
+        config.set_voice_id(legacy_voice)
+        log.info("migrated FISH_VOICE_ID env var into config.json")
+
+    legacy_wl = data_dir / "whitelist.json"
+    if legacy_wl.exists() and not config.list_users():
+        try:
+            import json
+            data = json.loads(legacy_wl.read_text())
+            users = data.get("allowed_users", [])
+            for u in users:
+                config.add_user(int(u))
+            if users:
+                log.info("migrated %d users from legacy whitelist.json", len(users))
+        except Exception:
+            log.exception("failed to migrate legacy whitelist.json (ignoring)")
+
+
 async def amain() -> None:
     logging.basicConfig(
         level=os.environ.get("LOG_LEVEL", "INFO"),
@@ -35,49 +79,93 @@ async def amain() -> None:
     )
 
     discord_token = _required("DISCORD_TOKEN")
+    fish_api_key = _required("FISH_AUDIO_API_KEY")
+    data_dir = Path(os.environ.get("DATA_DIR", "data"))
+    config_path = data_dir / "config.json"
+
+    config = ConfigStore(config_path)
+    _migrate_legacy_env(config, data_dir)
+
+    # Static FishConfig parts; voice_id is dynamic per-job, read from config.
     fish_cfg = FishConfig(
-        api_key=_required("FISH_AUDIO_API_KEY"),
-        voice_id=_required("FISH_VOICE_ID"),
+        api_key=fish_api_key,
+        voice_id="",  # placeholder; replaced at job time
         model=os.environ.get("FISH_MODEL", "s2-pro"),
         latency=os.environ.get("FISH_LATENCY", "low"),
     )
-    allowed = parse_int_set(os.environ.get("ALLOWED_GUILDS"))
-    if not allowed:
-        raise SystemExit("ALLOWED_GUILDS must contain at least one guild ID")
     max_text_len = int(os.environ.get("MAX_TEXT_LEN", "200"))
-
-    try:
-        owner_id = int(_required("BOT_OWNER"))
-    except ValueError as e:
-        raise SystemExit(f"BOT_OWNER must be a numeric Discord user ID: {e}")
-    whitelist_path = Path(os.environ.get("WHITELIST_PATH", "data/whitelist.json"))
-    whitelist = UserWhitelist(owner_id=owner_id, store_path=whitelist_path)
-    log.info(
-        "whitelist loaded: owner=%d, %d additional allowed",
-        owner_id, len(whitelist.list_users()),
-    )
 
     intents = discord.Intents.default()
     intents.message_content = True
     intents.voice_states = True
-    intents.members = True  # needed to look up user across guilds for DM
+    intents.members = True
 
     bot = commands.Bot(command_prefix="!", intents=intents)
     voice_mgr = VoiceManager(bot)
-    registry = PipelineRegistry(fish_cfg, voice_mgr, asyncio.get_running_loop())
+    registry = PipelineRegistry(fish_cfg, voice_mgr, asyncio.get_running_loop(), config)
+
+    # Owner is filled in at on_ready when bot.application is available.
+    state: dict[str, Optional[int]] = {"owner_id": None}
+
+    def owner_id_provider() -> Optional[int]:
+        return state["owner_id"]
 
     @bot.event
     async def on_ready() -> None:
-        log.info("logged in as %s (id=%s)", bot.user, getattr(bot.user, "id", "?"))
+        # Discord populates bot.application after login. Get the app owner.
+        app = await bot.application_info()
+        # `app.owner` may be a Team or User. For Team-owned apps, use the
+        # team's owner; for User-owned apps, use the user directly.
+        if app.team is not None and app.team.owner_id is not None:
+            owner_id = int(app.team.owner_id)
+        else:
+            owner_id = int(app.owner.id)
+        state["owner_id"] = owner_id
+        log.info(
+            "logged in as %s (id=%s); owner=%s; voice=%s; whitelist=%d users",
+            bot.user, getattr(bot.user, "id", "?"),
+            owner_id, config.get_voice_id() or "(unset)",
+            len(config.list_users()),
+        )
         synced = await bot.tree.sync()
         log.info("synced %d slash commands", len(synced))
+
+        # First-run DM to owner.
+        if config.is_first_run():
+            try:
+                user = bot.get_user(owner_id) or await bot.fetch_user(owner_id)
+                if user is not None:
+                    voice_hint = (
+                        f"Current voice: `{config.get_voice_id()}`."
+                        if config.get_voice_id()
+                        else "**No voice configured yet.** Run `/voice set <fish_voice_id>` "
+                             "to enable TTS. Find IDs at https://fish.audio Voice Library."
+                    )
+                    await user.send(
+                        "👋 Welcome — you're the owner of this Fish Audio TTS bot.\n\n"
+                        f"{voice_hint}\n\n"
+                        "**Quick start:**\n"
+                        "• `/help` — full command list\n"
+                        "• `/voice set <id>` — set the voice (you only)\n"
+                        "• `/whitelist add @user` — grant access to a friend\n"
+                        "• Invite the bot to a server, `/join` from a voice channel, then `/say hello`."
+                    )
+                    config.mark_first_run_done()
+                    log.info("first-run welcome DM sent to owner")
+            except discord.Forbidden:
+                log.warning(
+                    "could not DM owner (Forbidden — DMs may be closed). "
+                    "Run /help in a server instead."
+                )
+            except Exception:
+                log.exception("first-run DM failed; will retry next startup")
 
     await bot.add_cog(TTSCog(
         bot=bot,
         voice_manager=voice_mgr,
         registry=registry,
-        whitelist=whitelist,
-        allowed_guilds=allowed,
+        config_store=config,
+        owner_id_provider=owner_id_provider,
         max_text_len=max_text_len,
     ))
 
@@ -89,7 +177,6 @@ async def amain() -> None:
 
 
 def cli() -> None:
-    # Load .env.local from cwd or repo root
     for candidate in (Path.cwd() / ".env.local", Path(__file__).resolve().parents[2] / ".env.local"):
         if candidate.exists():
             load_dotenv(candidate)

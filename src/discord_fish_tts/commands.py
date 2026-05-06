@@ -1,4 +1,12 @@
-"""Discord slash commands + DM handler."""
+"""Discord slash commands + DM handler.
+
+Authorization model:
+  - Owner is derived from `bot.application.owner.id` and passed in at
+    construction time. Owner has full rights including whitelist management.
+  - Whitelisted users (in ConfigStore) can use voice/TTS commands.
+  - Everyone else is denied (silently for DMs to non-allowed users? no —
+    we reply to keep behavior obvious).
+"""
 from __future__ import annotations
 
 import asyncio
@@ -8,12 +16,10 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from .config_store import ConfigStore
 from .tts_pipeline import PipelineRegistry, TTSJob
-from .validators import (
-    ValidationError, check_guild, check_text,
-)
+from .validators import ValidationError, check_text
 from .voice_manager import VoiceManager
-from .whitelist import UserWhitelist
 
 log = logging.getLogger(__name__)
 
@@ -24,55 +30,66 @@ class TTSCog(commands.Cog):
         bot: commands.Bot,
         voice_manager: VoiceManager,
         registry: PipelineRegistry,
-        whitelist: UserWhitelist,
-        allowed_guilds: set[int],
+        config_store: ConfigStore,
+        owner_id_provider,  # () -> int | None — late-bound (owner known after on_ready)
         max_text_len: int,
     ) -> None:
         self.bot = bot
         self.voice_manager = voice_manager
         self.registry = registry
-        self.whitelist = whitelist
-        self.allowed_guilds = allowed_guilds
+        self.config = config_store
+        self._owner_id_provider = owner_id_provider
         self.max_text_len = max_text_len
 
-    # ----- helpers -----
+    # ---- helpers ----
+
+    def _owner_id(self) -> int | None:
+        return self._owner_id_provider()
+
+    def _is_owner(self, user_id: int) -> bool:
+        oid = self._owner_id()
+        return oid is not None and user_id == oid
+
+    def _is_allowed(self, user_id: int) -> bool:
+        return self._is_owner(user_id) or self.config.is_user_whitelisted(user_id)
 
     def _user_voice_channel(self, member: discord.Member) -> discord.VoiceChannel | None:
-        if member.voice and isinstance(member.voice.channel, (discord.VoiceChannel,)):
+        if member.voice and isinstance(member.voice.channel, discord.VoiceChannel):
             return member.voice.channel
         return None
 
     def _find_user_voice_anywhere(
         self, user_id: int
     ) -> tuple[int, int] | None:
-        """For DM: scan whitelisted guilds in iteration order."""
-        for gid in self.allowed_guilds:
-            guild = self.bot.get_guild(gid)
-            if guild is None:
-                continue
+        """For DM: scan all guilds the bot is in for this user's voice channel."""
+        for guild in self.bot.guilds:
             member = guild.get_member(user_id)
             if member and member.voice and member.voice.channel:
                 return guild.id, member.voice.channel.id
         return None
 
-    async def _deny_if_not_allowed(
-        self, interaction: discord.Interaction
-    ) -> bool:
-        """Replies ephemeral and returns True if user is not whitelisted."""
-        if not self.whitelist.is_allowed(interaction.user.id):
+    async def _deny_if_not_allowed(self, interaction: discord.Interaction) -> bool:
+        if not self._is_allowed(interaction.user.id):
             await interaction.response.send_message(
                 "You are not authorized to use this bot.", ephemeral=True
             )
             return True
         return False
 
-    # ----- slash commands -----
+    async def _deny_if_not_owner(self, interaction: discord.Interaction) -> bool:
+        if not self._is_owner(interaction.user.id):
+            await interaction.response.send_message(
+                "Only the bot owner can use this command.", ephemeral=True
+            )
+            return True
+        return False
+
+    # ---- /say ----
 
     @app_commands.command(name="say", description="Speak text in the bot's current voice channel.")
     @app_commands.describe(text="Text to speak (max 200 chars)")
     async def say(self, interaction: discord.Interaction, text: str) -> None:
         try:
-            check_guild(interaction.guild_id, allowed=self.allowed_guilds)
             text = check_text(text, max_len=self.max_text_len)
         except ValidationError as e:
             await interaction.response.send_message(str(e), ephemeral=True)
@@ -85,6 +102,13 @@ class TTSCog(commands.Cog):
             await interaction.response.send_message("Run /say from a server.", ephemeral=True)
             return
 
+        if self.config.get_voice_id() is None:
+            await interaction.response.send_message(
+                "No voice configured yet. Owner must run `/voice set <fish_voice_id>` first.",
+                ephemeral=True,
+            )
+            return
+
         user_ch = self._user_voice_channel(interaction.user)
         if user_ch is None:
             await interaction.response.send_message(
@@ -92,7 +116,6 @@ class TTSCog(commands.Cog):
             )
             return
 
-        # Bot must already be in the user's exact channel; /say does not summon.
         bot_ch_id = self.voice_manager.current_channel_id(interaction.guild_id)  # type: ignore[arg-type]
         if bot_ch_id is None:
             await interaction.response.send_message(
@@ -126,13 +149,10 @@ class TTSCog(commands.Cog):
 
         await interaction.response.send_message("Queued.", ephemeral=True)
 
+    # ---- /join /leave /skip ----
+
     @app_commands.command(name="join", description="Summon the bot to your current voice channel.")
     async def join(self, interaction: discord.Interaction) -> None:
-        try:
-            check_guild(interaction.guild_id, allowed=self.allowed_guilds)
-        except ValidationError as e:
-            await interaction.response.send_message(str(e), ephemeral=True)
-            return
         if await self._deny_if_not_allowed(interaction):
             return
         if not isinstance(interaction.user, discord.Member):
@@ -147,11 +167,6 @@ class TTSCog(commands.Cog):
 
     @app_commands.command(name="leave", description="Disconnect the bot from its voice channel.")
     async def leave(self, interaction: discord.Interaction) -> None:
-        try:
-            check_guild(interaction.guild_id, allowed=self.allowed_guilds)
-        except ValidationError as e:
-            await interaction.response.send_message(str(e), ephemeral=True)
-            return
         if await self._deny_if_not_allowed(interaction):
             return
         ok = await self.voice_manager.leave(interaction.guild_id)  # type: ignore[arg-type]
@@ -160,11 +175,6 @@ class TTSCog(commands.Cog):
 
     @app_commands.command(name="skip", description="Skip the currently playing TTS.")
     async def skip(self, interaction: discord.Interaction) -> None:
-        try:
-            check_guild(interaction.guild_id, allowed=self.allowed_guilds)
-        except ValidationError as e:
-            await interaction.response.send_message(str(e), ephemeral=True)
-            return
         if await self._deny_if_not_allowed(interaction):
             return
         pipeline = self.registry.get_or_create(interaction.guild_id)  # type: ignore[arg-type]
@@ -172,22 +182,39 @@ class TTSCog(commands.Cog):
         msg = "Skipped." if ok else "Nothing playing."
         await interaction.response.send_message(msg, ephemeral=True)
 
-    # ----- /whitelist (owner-only) -----
+    # ---- /voice ----
+
+    voice_group = app_commands.Group(
+        name="voice",
+        description="Show or change the Fish Audio voice (owner can set).",
+    )
+
+    @voice_group.command(name="show", description="Show the current Fish Audio voice ID.")
+    async def voice_show(self, interaction: discord.Interaction) -> None:
+        vid = self.config.get_voice_id()
+        msg = f"Current voice: `{vid}`" if vid else "No voice configured. Owner: run `/voice set <id>`."
+        await interaction.response.send_message(msg, ephemeral=True)
+
+    @voice_group.command(name="set", description="Set the global Fish Audio voice ID (owner only).")
+    @app_commands.describe(voice_id="A Fish Audio reference_id")
+    async def voice_set(self, interaction: discord.Interaction, voice_id: str) -> None:
+        if await self._deny_if_not_owner(interaction):
+            return
+        voice_id = voice_id.strip()
+        if not voice_id:
+            await interaction.response.send_message("voice_id cannot be empty.", ephemeral=True)
+            return
+        self.config.set_voice_id(voice_id)
+        await interaction.response.send_message(
+            f"Voice set to `{voice_id}`.", ephemeral=True
+        )
+
+    # ---- /whitelist ----
 
     whitelist_group = app_commands.Group(
         name="whitelist",
         description="Manage the user whitelist (owner only).",
     )
-
-    async def _deny_if_not_owner(
-        self, interaction: discord.Interaction
-    ) -> bool:
-        if not self.whitelist.is_owner(interaction.user.id):
-            await interaction.response.send_message(
-                "Only the bot owner can manage the whitelist.", ephemeral=True
-            )
-            return True
-        return False
 
     @whitelist_group.command(name="add", description="Add a user to the whitelist.")
     @app_commands.describe(user="The Discord user to add.")
@@ -196,13 +223,13 @@ class TTSCog(commands.Cog):
     ) -> None:
         if await self._deny_if_not_owner(interaction):
             return
-        if self.whitelist.is_owner(user.id):
+        if self._is_owner(user.id):
             await interaction.response.send_message(
                 f"{user.mention} is the owner — already always allowed.",
                 ephemeral=True,
             )
             return
-        added = self.whitelist.add(user.id)
+        added = self.config.add_user(user.id)
         msg = (
             f"Added {user.mention} to the whitelist."
             if added else f"{user.mention} is already in the whitelist."
@@ -216,12 +243,7 @@ class TTSCog(commands.Cog):
     ) -> None:
         if await self._deny_if_not_owner(interaction):
             return
-        if self.whitelist.is_owner(user.id):
-            await interaction.response.send_message(
-                "Cannot remove the owner.", ephemeral=True
-            )
-            return
-        removed = self.whitelist.remove(user.id)
+        removed = self.config.remove_user(user.id)
         msg = (
             f"Removed {user.mention} from the whitelist."
             if removed else f"{user.mention} is not in the whitelist."
@@ -232,31 +254,66 @@ class TTSCog(commands.Cog):
     async def whitelist_list(self, interaction: discord.Interaction) -> None:
         if await self._deny_if_not_owner(interaction):
             return
-        owner_id = self.whitelist.owner_id
-        users = self.whitelist.list_users()
+        oid = self._owner_id()
+        users = self.config.list_users()
+        owner_line = f"Owner: <@{oid}>" if oid else "Owner: (unknown)"
         if not users:
             await interaction.response.send_message(
-                f"Owner: <@{owner_id}>\nWhitelist: (empty)",
-                ephemeral=True,
+                f"{owner_line}\nWhitelist: (empty)", ephemeral=True,
             )
             return
         mentions = "\n".join(f"• <@{u}>" for u in users)
         await interaction.response.send_message(
-            f"Owner: <@{owner_id}>\nWhitelisted users:\n{mentions}",
-            ephemeral=True,
+            f"{owner_line}\nWhitelisted users:\n{mentions}", ephemeral=True,
         )
 
-    # ----- DM listener -----
+    # ---- /help ----
+
+    @app_commands.command(name="help", description="Show how to use this bot.")
+    async def help_cmd(self, interaction: discord.Interaction) -> None:
+        oid = self._owner_id()
+        is_owner = oid is not None and interaction.user.id == oid
+        lines = [
+            "**discord-fishaudio-TTS** — text-to-speech in voice channels via Fish Audio.",
+            "",
+            "**Voice commands** (whitelisted users only):",
+            "• `/join` — summon the bot to your current voice channel",
+            "• `/say <text>` — speak text (bot must be in your channel)",
+            "• `/skip` — stop the currently-playing TTS",
+            "• `/leave` — disconnect the bot",
+            "• DM the bot text → speaks in your voice channel (bot must already be there)",
+            "",
+            "**Voice config:**",
+            "• `/voice show` — current Fish Audio voice ID",
+        ]
+        if is_owner:
+            lines += [
+                "• `/voice set <id>` — change the voice (owner only)",
+                "",
+                "**Whitelist (owner only):**",
+                "• `/whitelist add @user` — grant access",
+                "• `/whitelist remove @user` — revoke access",
+                "• `/whitelist list` — show current whitelist",
+            ]
+        await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+    # ---- DM listener ----
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
         if message.author.bot:
             return
         if message.guild is not None:
-            return  # only react to DMs
+            return  # DM-only
 
-        if not self.whitelist.is_allowed(message.author.id):
+        if not self._is_allowed(message.author.id):
             await message.reply("You are not authorized to use this bot.")
+            return
+
+        if self.config.get_voice_id() is None:
+            await message.reply(
+                "No voice configured. Run `/voice set <fish_voice_id>` first."
+            )
             return
 
         text = message.content
@@ -269,17 +326,14 @@ class TTSCog(commands.Cog):
         found = self._find_user_voice_anywhere(message.author.id)
         if found is None:
             await message.reply(
-                "You're not in a voice channel in any authorized server."
+                "You're not in a voice channel in any server I'm in."
             )
             return
         guild_id, channel_id = found
 
-        # Manual-summon model: bot must already be in the user's channel.
         bot_ch_id = self.voice_manager.current_channel_id(guild_id)
         if bot_ch_id is None:
-            await message.reply(
-                "I'm not in a voice channel. Use `/join` first."
-            )
+            await message.reply("I'm not in a voice channel. Use `/join` first.")
             return
         if bot_ch_id != channel_id:
             await message.reply(

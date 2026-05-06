@@ -4,12 +4,20 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from discord_fish_tts.tts_pipeline import (
     GuildTTSPipeline, PipelineRegistry, TTSJob,
 )
+from discord_fish_tts.config_store import ConfigStore
 from discord_fish_tts.fish_client import FishConfig
 
 
 @pytest.fixture
 def fish_cfg():
     return FishConfig(api_key="x", voice_id="y")
+
+
+@pytest.fixture
+def cfg_store(tmp_path):
+    s = ConfigStore(tmp_path / "config.json")
+    s.set_voice_id("voice-from-config")
+    return s
 
 
 def make_voice_mgr():
@@ -25,10 +33,10 @@ def make_voice_mgr():
 
 
 @pytest.mark.asyncio
-async def test_jobs_run_in_fifo_order(fish_cfg):
+async def test_jobs_run_in_fifo_order(fish_cfg, cfg_store):
     vm = make_voice_mgr()
     loop = asyncio.get_running_loop()
-    pipeline = GuildTTSPipeline(1, fish_cfg, vm, loop)
+    pipeline = GuildTTSPipeline(1, fish_cfg, vm, loop, cfg_store)
 
     played: list[str] = []
 
@@ -57,10 +65,10 @@ async def test_jobs_run_in_fifo_order(fish_cfg):
 
 
 @pytest.mark.asyncio
-async def test_skip_cancels_current(fish_cfg):
+async def test_skip_cancels_current(fish_cfg, cfg_store):
     vm = make_voice_mgr()
     loop = asyncio.get_running_loop()
-    pipeline = GuildTTSPipeline(1, fish_cfg, vm, loop)
+    pipeline = GuildTTSPipeline(1, fish_cfg, vm, loop, cfg_store)
 
     started = asyncio.Event()
     cancelled = asyncio.Event()
@@ -90,10 +98,10 @@ async def test_skip_cancels_current(fish_cfg):
 
 
 @pytest.mark.asyncio
-async def test_skip_returns_false_when_idle(fish_cfg):
+async def test_skip_returns_false_when_idle(fish_cfg, cfg_store):
     vm = make_voice_mgr()
     loop = asyncio.get_running_loop()
-    pipeline = GuildTTSPipeline(1, fish_cfg, vm, loop)
+    pipeline = GuildTTSPipeline(1, fish_cfg, vm, loop, cfg_store)
     await pipeline.start()
     try:
         ok = await pipeline.skip_current()
@@ -103,10 +111,10 @@ async def test_skip_returns_false_when_idle(fish_cfg):
 
 
 @pytest.mark.asyncio
-async def test_pipeline_registry_lazy_create(fish_cfg):
+async def test_pipeline_registry_lazy_create(fish_cfg, cfg_store):
     vm = make_voice_mgr()
     loop = asyncio.get_running_loop()
-    reg = PipelineRegistry(fish_cfg, vm, loop)
+    reg = PipelineRegistry(fish_cfg, vm, loop, cfg_store)
     p1 = reg.get_or_create(1)
     p2 = reg.get_or_create(1)
     p3 = reg.get_or_create(2)
