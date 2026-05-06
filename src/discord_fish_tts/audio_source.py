@@ -1,12 +1,16 @@
-"""Bridge async producer (asyncio.Queue of Opus packets) to discord.py's
+"""Bridge producer (thread-safe queue of Opus packets) to discord.py's
 synchronous AudioSource interface. With is_opus()=True, discord.py treats
 each read() return value as a complete Opus packet and forwards it directly
 into RTP — no PCM↔Opus conversion happens, enabling mono pass-through.
+
+Uses a sync queue.Queue (not asyncio.Queue) so read() — which runs on
+discord.py's player thread — can wait with a real timeout without
+spawning orphaned get() coroutines that would silently consume packets
+intended for the next read() call.
 """
 from __future__ import annotations
 
-import asyncio
-from concurrent.futures import TimeoutError as FutTimeoutError
+import queue as _queue
 from typing import Optional
 
 import discord
@@ -21,13 +25,8 @@ _READ_BUDGET_S = 0.015
 
 
 class StreamingOpusAudioSource(discord.AudioSource):
-    def __init__(
-        self,
-        queue: "asyncio.Queue[Optional[bytes]]",
-        loop: asyncio.AbstractEventLoop,
-    ) -> None:
-        self._queue = queue
-        self._loop = loop
+    def __init__(self, frame_queue: "_queue.Queue[Optional[bytes]]") -> None:
+        self._queue = frame_queue
         self._eof = False
 
     def is_opus(self) -> bool:
@@ -37,14 +36,9 @@ class StreamingOpusAudioSource(discord.AudioSource):
         if self._eof:
             return b""
         try:
-            fut = asyncio.run_coroutine_threadsafe(self._queue.get(), self._loop)
-            item = fut.result(timeout=_READ_BUDGET_S)
-        except FutTimeoutError:
+            item = self._queue.get(timeout=_READ_BUDGET_S)
+        except _queue.Empty:
             return SILENCE_OPUS
-        except RuntimeError:
-            # Loop closed; treat as EOF
-            self._eof = True
-            return b""
 
         if item is None:
             self._eof = True

@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import queue as _queue
 from dataclasses import dataclass
 from typing import Optional
 
@@ -19,6 +20,20 @@ log = logging.getLogger(__name__)
 QUEUE_MAXSIZE_DEFAULT = 20
 PLAY_TIMEOUT_S = 120
 FRAME_QUEUE_MAXSIZE = 200
+
+
+async def _put_with_backpressure(q: "_queue.Queue", item: bytes) -> None:
+    """Put into a sync queue from async; if full, briefly yield and retry.
+
+    Avoids blocking the event loop on a full queue, while still applying
+    backpressure to the producer so we don't OOM if Discord stalls.
+    """
+    while True:
+        try:
+            q.put_nowait(item)
+            return
+        except _queue.Full:
+            await asyncio.sleep(0.005)
 
 
 @dataclass
@@ -96,23 +111,34 @@ class GuildTTSPipeline:
             job.guild_id, job.voice_channel_id
         )
 
-        frame_queue: asyncio.Queue[bytes | None] = asyncio.Queue(
+        # Thread-safe sync queue: discord.py's player thread reads from it
+        # via StreamingOpusAudioSource.read(). Using asyncio.Queue here would
+        # require asyncio.run_coroutine_threadsafe in read(), whose orphaned
+        # get() coroutines silently consume packets when read() times out.
+        frame_queue: _queue.Queue[bytes | None] = _queue.Queue(
             maxsize=FRAME_QUEUE_MAXSIZE
         )
         demux = OggDemuxer()
-        source = StreamingOpusAudioSource(frame_queue, self._loop)
+        source = StreamingOpusAudioSource(frame_queue)
 
         async def producer() -> None:
             try:
                 async for chunk in stream_opus_ogg(job.text, self._fish_cfg):
                     demux.feed(chunk)
                     for pkt in demux.packets():
-                        await frame_queue.put(pkt)
+                        # put() blocks if full, but in async context we need
+                        # to yield. Use put_nowait with a tiny retry loop.
+                        await _put_with_backpressure(frame_queue, pkt)
                 for pkt in demux.flush():
-                    await frame_queue.put(pkt)
+                    await _put_with_backpressure(frame_queue, pkt)
             finally:
-                with contextlib.suppress(asyncio.QueueFull):
+                # EOF marker. Use put_nowait; if queue is full, drop (but
+                # producer already finished, so consumer will hit underrun
+                # silence and we can't help it).
+                try:
                     frame_queue.put_nowait(None)
+                except _queue.Full:
+                    pass
 
         producer_task = asyncio.create_task(producer(), name="tts-producer")
 
