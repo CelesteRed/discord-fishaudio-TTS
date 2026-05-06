@@ -24,3 +24,7 @@ dist/
 # Local dev
 _scripts/__pycache__/
 /tmp/
+
+# Tooling / internal docs (kept locally, not published)
+.claude/
+docs/
