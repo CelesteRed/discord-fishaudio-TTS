@@ -151,19 +151,48 @@ class TTSCog(commands.Cog):
 
     # ---- /join /leave /skip ----
 
-    @app_commands.command(name="join", description="Summon the bot to your current voice channel.")
-    async def join(self, interaction: discord.Interaction) -> None:
+    @app_commands.command(
+        name="join",
+        description="Summon the bot to a voice channel (defaults to yours).",
+    )
+    @app_commands.describe(
+        channel="Voice channel to summon to. Leave empty to use your current channel.",
+    )
+    async def join(
+        self,
+        interaction: discord.Interaction,
+        channel: discord.VoiceChannel | None = None,
+    ) -> None:
         if await self._deny_if_not_allowed(interaction):
             return
-        if not isinstance(interaction.user, discord.Member):
-            await interaction.response.send_message("Run /join from a server.", ephemeral=True)
+        if interaction.guild_id is None:
+            await interaction.response.send_message(
+                "Run /join from a server, not in DM.", ephemeral=True,
+            )
             return
-        ch = self._user_voice_channel(interaction.user)
-        if ch is None:
-            await interaction.response.send_message("Join a voice channel first.", ephemeral=True)
+
+        target = channel
+        if target is None:
+            if not isinstance(interaction.user, discord.Member):
+                await interaction.response.send_message(
+                    "Run /join from a server.", ephemeral=True,
+                )
+                return
+            target = self._user_voice_channel(interaction.user)
+            if target is None:
+                await interaction.response.send_message(
+                    "Join a voice channel first, or specify one: `/join channel:<name>`.",
+                    ephemeral=True,
+                )
+                return
+        elif target.guild.id != interaction.guild_id:
+            await interaction.response.send_message(
+                "That voice channel is not in this server.", ephemeral=True,
+            )
             return
-        await self.voice_manager.ensure_in_channel(interaction.guild_id, ch.id)  # type: ignore[arg-type]
-        await interaction.response.send_message(f"Joined {ch.name}.", ephemeral=True)
+
+        await self.voice_manager.ensure_in_channel(interaction.guild_id, target.id)
+        await interaction.response.send_message(f"Joined {target.name}.", ephemeral=True)
 
     @app_commands.command(name="leave", description="Disconnect the bot from its voice channel.")
     async def leave(self, interaction: discord.Interaction) -> None:
@@ -187,6 +216,9 @@ class TTSCog(commands.Cog):
     voice_group = app_commands.Group(
         name="voice",
         description="Show or change the Fish Audio voice (owner can set).",
+        allowed_contexts=app_commands.AppCommandContext(
+            guild=True, dm_channel=True, private_channel=True,
+        ),
     )
 
     @voice_group.command(name="show", description="Show the current Fish Audio voice ID.")
@@ -214,6 +246,9 @@ class TTSCog(commands.Cog):
     whitelist_group = app_commands.Group(
         name="whitelist",
         description="Manage the user whitelist (owner only).",
+        allowed_contexts=app_commands.AppCommandContext(
+            guild=True, dm_channel=True, private_channel=True,
+        ),
     )
 
     @whitelist_group.command(name="add", description="Add a user to the whitelist.")
@@ -230,11 +265,38 @@ class TTSCog(commands.Cog):
             )
             return
         added = self.config.add_user(user.id)
-        msg = (
-            f"Added {user.mention} to the whitelist."
-            if added else f"{user.mention} is already in the whitelist."
+        if not added:
+            await interaction.response.send_message(
+                f"{user.mention} is already in the whitelist.", ephemeral=True,
+            )
+            return
+
+        # Try welcome DM. Don't block the command on DM failure.
+        oid = self._owner_id()
+        owner_mention = f"<@{oid}>" if oid is not None else "the owner"
+        bot_name = (interaction.client.user.name
+                    if interaction.client.user else "this bot")
+        welcome = (
+            f"👋 You've been added to **{bot_name}**'s whitelist by {owner_mention}.\n\n"
+            "**You can now:**\n"
+            "• In any server I'm in: join a voice channel → `/join` → `/say <text>` and "
+            "I'll speak via Fish Audio TTS.\n"
+            "• DM me text → I speak it in your voice channel (I must already be there — "
+            "use `/join` first in a server we share).\n"
+            "• `/help` for the full command list.\n\n"
+            "Welcome!"
         )
-        await interaction.response.send_message(msg, ephemeral=True)
+        dm_ok = True
+        try:
+            await user.send(welcome)
+        except (discord.Forbidden, discord.HTTPException):
+            dm_ok = False
+
+        suffix = "" if dm_ok else " (could not DM them — they may have DMs disabled)"
+        await interaction.response.send_message(
+            f"Added {user.mention} to the whitelist.{suffix}",
+            ephemeral=True,
+        )
 
     @whitelist_group.command(name="remove", description="Remove a user from the whitelist.")
     @app_commands.describe(user="The Discord user to remove.")
@@ -270,6 +332,7 @@ class TTSCog(commands.Cog):
     # ---- /help ----
 
     @app_commands.command(name="help", description="Show how to use this bot.")
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
     async def help_cmd(self, interaction: discord.Interaction) -> None:
         oid = self._owner_id()
         is_owner = oid is not None and interaction.user.id == oid
