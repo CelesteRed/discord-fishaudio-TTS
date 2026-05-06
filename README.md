@@ -2,14 +2,17 @@
 
 Standalone Python Discord bot that speaks user-provided text in voice channels via [Fish Audio](https://fish.audio) TTS Live (streaming WebSocket). Companion project to my TypeScript [openclaw-fish-audio-live](https://github.com/averatec/openclaw-fish-audio-live) plugin — same API, different deployment pattern.
 
-## Features (v1 MVP)
+## Features (v1.1)
 
-- `/say <text>` — bot joins your voice channel and speaks
-- DM the bot text → bot speaks in whichever authorized server you're currently in voice
-- `/join` `/leave` `/skip` — manual controls
+- `/say <text>` — speak text in the bot's current voice channel (does **not** summon)
+- `/join` — summon the bot to your voice channel (the only command that moves the bot)
+- `/leave` — disconnect the bot
+- `/skip` — stop the currently-playing TTS
+- DM the bot text → speaks in your voice channel (only if the bot is already there)
+- `/whitelist add | remove | list` — owner-only user management
 - Per-guild FIFO queue
 - **Real streaming playback** — first audio plays before full synthesis completes
-- Guild whitelist
+- Guild whitelist + per-user whitelist (JSON-persisted, owner-managed)
 - 200-char text limit
 
 ## Architecture
@@ -28,7 +31,8 @@ Fish WS (msgpack)  ─►  Ogg/Opus chunks  ─►  Ogg demuxer  ─►  Opus pa
 | `audio_source.py` | Thread-safe queue → `discord.AudioSource.read()` bridge |
 | `tts_pipeline.py` | Per-guild FIFO queue, worker, skip semantics |
 | `voice_manager.py` | discord.py voice client lifecycle wrapper |
-| `validators.py` | Guild whitelist, text length, env CSV parsing |
+| `validators.py` | Guild allowlist, text length, env CSV parsing |
+| `whitelist.py` | Owner + JSON-persisted user whitelist |
 | `commands.py` | Slash commands and DM handler (Cog) |
 | `bot.py` | Entry point, `.env` loading, intents |
 
@@ -44,10 +48,12 @@ pip install -e ".[dev]"
 
 cp .env.example .env.local
 # Edit .env.local with:
-#   DISCORD_TOKEN    — https://discord.com/developers/applications → Bot → Reset Token
+#   DISCORD_TOKEN      — https://discord.com/developers/applications → Bot → Reset Token
 #   FISH_AUDIO_API_KEY — https://fish.audio Account → API
-#   FISH_VOICE_ID    — https://fish.audio Voice Library
-#   ALLOWED_GUILDS   — comma-separated Discord server IDs
+#   FISH_VOICE_ID      — https://fish.audio Voice Library
+#   ALLOWED_GUILDS     — comma-separated Discord server IDs (Developer Mode → right-click server → Copy Server ID)
+#   BOT_OWNER          — your Discord user ID (Developer Mode → right-click your name → Copy User ID).
+#                        Whoever runs the bot is its owner: only this account can manage the whitelist.
 
 discord-fish-tts
 ```
@@ -62,16 +68,22 @@ pytest -v
 
 31 tests covering Ogg demuxing (against a captured Fish output fixture), MessagePack WebSocket protocol mocking, cross-thread audio source bridging, FIFO queue with skip semantics, and input validation.
 
-## Roadmap
+## Authorization model
 
-- Manual `/join` summoning + voice channel locking
-- Per-user whitelist
+- **Owner** (env `BOT_OWNER`, single user, immutable at runtime, never removable from the whitelist).
+- **Whitelisted users** (managed via `/whitelist add | remove | list` by owner, persisted in `data/whitelist.json`).
+- **Everyone else**: cannot use the bot, even in an authorized guild.
+
+A typical deploy is a friend-group bot: the owner runs the host, then `/whitelist add` for each friend who should have access.
+
+## Roadmap (v1.2+)
+
 - `/voice` selection from your Fish Audio voice library
 - Inline directives (`[[voice=...]] [[speed=...]]`)
-- Latency telemetry display
+- Latency telemetry display ("first audio in 320ms")
 - HTTP fallback transport
 - Idle auto-leave
-- SQLite persistence for user preferences
+- SQLite persistence for user preferences (default voice, etc.)
 
 ## License
 

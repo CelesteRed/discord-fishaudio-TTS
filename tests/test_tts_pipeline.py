@@ -18,7 +18,8 @@ def make_voice_mgr():
     vc.is_playing = MagicMock(return_value=False)
     vc.play = MagicMock()
     vc.stop = MagicMock()
-    vm.ensure_in_channel = AsyncMock(return_value=vc)
+    # New manual-summon API: pipeline expects bot to already be in the channel
+    vm.get_voice_client_in_channel = MagicMock(return_value=vc)
     vm._vc = vc
     return vm
 

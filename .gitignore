@@ -28,3 +28,6 @@ _scripts/__pycache__/
 # Tooling / internal docs (kept locally, not published)
 .claude/
 docs/
+
+# Runtime state (whitelist JSON etc)
+data/

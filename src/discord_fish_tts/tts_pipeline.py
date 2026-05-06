@@ -107,9 +107,17 @@ class GuildTTSPipeline:
                 self._queue.task_done()
 
     async def _play_one(self, job: TTSJob) -> None:
-        voice_client = await self._voice_manager.ensure_in_channel(
+        # Manual-summon model: do NOT move the bot from /say. The bot must
+        # already be present in the requested voice channel (placed there
+        # by /join). If not, fail this job loudly so the worker logs it
+        # and the user can be informed by the command layer.
+        voice_client = self._voice_manager.get_voice_client_in_channel(
             job.guild_id, job.voice_channel_id
         )
+        if voice_client is None:
+            raise RuntimeError(
+                "bot is not in the requested voice channel; /join required"
+            )
 
         # Thread-safe sync queue: discord.py's player thread reads from it
         # via StreamingOpusAudioSource.read(). Using asyncio.Queue here would

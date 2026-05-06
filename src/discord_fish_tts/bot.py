@@ -16,6 +16,7 @@ from .fish_client import FishConfig
 from .tts_pipeline import PipelineRegistry
 from .validators import parse_int_set
 from .voice_manager import VoiceManager
+from .whitelist import UserWhitelist
 
 log = logging.getLogger(__name__)
 
@@ -45,6 +46,17 @@ async def amain() -> None:
         raise SystemExit("ALLOWED_GUILDS must contain at least one guild ID")
     max_text_len = int(os.environ.get("MAX_TEXT_LEN", "200"))
 
+    try:
+        owner_id = int(_required("BOT_OWNER"))
+    except ValueError as e:
+        raise SystemExit(f"BOT_OWNER must be a numeric Discord user ID: {e}")
+    whitelist_path = Path(os.environ.get("WHITELIST_PATH", "data/whitelist.json"))
+    whitelist = UserWhitelist(owner_id=owner_id, store_path=whitelist_path)
+    log.info(
+        "whitelist loaded: owner=%d, %d additional allowed",
+        owner_id, len(whitelist.list_users()),
+    )
+
     intents = discord.Intents.default()
     intents.message_content = True
     intents.voice_states = True
@@ -64,6 +76,7 @@ async def amain() -> None:
         bot=bot,
         voice_manager=voice_mgr,
         registry=registry,
+        whitelist=whitelist,
         allowed_guilds=allowed,
         max_text_len=max_text_len,
     ))
