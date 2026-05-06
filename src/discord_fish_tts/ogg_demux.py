@@ -12,6 +12,7 @@ Per RFC 3533 (Ogg) and RFC 7845 (Ogg encapsulation of Opus):
 """
 from __future__ import annotations
 
+from collections import deque
 from typing import Iterator
 
 
@@ -19,7 +20,7 @@ class OggDemuxer:
     def __init__(self) -> None:
         self._buf = bytearray()
         self._packet_carry = bytearray()  # leftover from a continued packet
-        self._pending_audio: list[bytes] = []  # extracted but not yet handed out
+        self._pending_audio: deque[bytes] = deque()  # extracted but not yet handed out
         self._non_audio_skipped = 0  # OpusHead + OpusTags
 
     def feed(self, data: bytes) -> None:
@@ -30,13 +31,13 @@ class OggDemuxer:
 
     def packets(self) -> Iterator[bytes]:
         while self._pending_audio:
-            yield self._pending_audio.pop(0)
+            yield self._pending_audio.popleft()
 
     def flush(self) -> Iterator[bytes]:
         # Try one more parse pass in case data was waiting.
         self._parse_pages()
         while self._pending_audio:
-            yield self._pending_audio.pop(0)
+            yield self._pending_audio.popleft()
 
     def _parse_pages(self) -> None:
         while True:
