@@ -136,19 +136,19 @@ async def amain() -> None:
                 user = bot.get_user(owner_id) or await bot.fetch_user(owner_id)
                 if user is not None:
                     voice_hint = (
-                        f"Current voice: `{config.get_voice_id()}`."
+                        f"✅ Voice already set: `{config.get_voice_id()}`."
                         if config.get_voice_id()
-                        else "**No voice configured yet.** Run `/voice set <fish_voice_id>` "
-                             "to enable TTS. Find IDs at https://fish.audio Voice Library."
+                        else "⚠️  **No voice yet.** Run `/voice set <fish_voice_id>` to enable TTS.\n"
+                             "   (Find IDs at https://fish.audio → Voice Library)"
                     )
                     await user.send(
                         "👋 Welcome — you're the owner of this Fish Audio TTS bot.\n\n"
                         f"{voice_hint}\n\n"
-                        "**Quick start:**\n"
-                        "• `/help` — full command list\n"
-                        "• `/voice set <id>` — set the voice (you only)\n"
-                        "• `/whitelist add @user` — grant access to a friend\n"
-                        "• Invite the bot to a server, `/join` from a voice channel, then `/say hello`."
+                        "**Setup checklist:**\n"
+                        "1. `/voice set <id>` — set the voice (DM works)\n"
+                        "2. `/whitelist add @friend` — grant access\n"
+                        "3. Invite me to a server → join voice → `/join` → `/say hello`\n\n"
+                        "Run `/help` anytime."
                     )
                     config.mark_first_run_done()
                     log.info("first-run welcome DM sent to owner")

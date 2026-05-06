@@ -104,7 +104,7 @@ class TTSCog(commands.Cog):
 
         if self.config.get_voice_id() is None:
             await interaction.response.send_message(
-                "No voice configured yet. Owner must run `/voice set <fish_voice_id>` first.",
+                "No voice configured. Owner: run `/voice set <fish_voice_id>` first.",
                 ephemeral=True,
             )
             return
@@ -112,23 +112,21 @@ class TTSCog(commands.Cog):
         user_ch = self._user_voice_channel(interaction.user)
         if user_ch is None:
             await interaction.response.send_message(
-                "Join a voice channel first.", ephemeral=True
+                "Join a voice channel first.", ephemeral=True,
             )
             return
 
         bot_ch_id = self.voice_manager.current_channel_id(interaction.guild_id)  # type: ignore[arg-type]
         if bot_ch_id is None:
             await interaction.response.send_message(
-                "I'm not in any voice channel. Use `/join` to summon me.",
-                ephemeral=True,
+                "I'm not in voice. Run `/join` to summon me.", ephemeral=True,
             )
             return
         if bot_ch_id != user_ch.id:
             bot_ch = interaction.guild.get_channel(bot_ch_id) if interaction.guild else None
-            ch_name = bot_ch.name if bot_ch else f"<#{bot_ch_id}>"
+            ch_name = bot_ch.name if bot_ch else f"#<{bot_ch_id}>"
             await interaction.response.send_message(
-                f"I'm currently in **{ch_name}**. Join that channel, "
-                f"or use `/leave` and then `/join` from your channel.",
+                f"I'm in **#{ch_name}**. Run `/join` from your channel to bring me over.",
                 ephemeral=True,
             )
             return
@@ -272,19 +270,16 @@ class TTSCog(commands.Cog):
             return
 
         # Try welcome DM. Don't block the command on DM failure.
-        oid = self._owner_id()
-        owner_mention = f"<@{oid}>" if oid is not None else "the owner"
         bot_name = (interaction.client.user.name
                     if interaction.client.user else "this bot")
         welcome = (
-            f"👋 You've been added to **{bot_name}**'s whitelist by {owner_mention}.\n\n"
-            "**You can now:**\n"
-            "• In any server I'm in: join a voice channel → `/join` → `/say <text>` and "
-            "I'll speak via Fish Audio TTS.\n"
-            "• DM me text → I speak it in your voice channel (I must already be there — "
-            "use `/join` first in a server we share).\n"
-            "• `/help` for the full command list.\n\n"
-            "Welcome!"
+            f"👋 You can use **{bot_name}** now!\n\n"
+            "🎤 In any server I'm in:\n"
+            "• Join a voice channel\n"
+            "• `/join` (summon me) → `/say hello` (I speak)\n\n"
+            "💬 In DM (here):\n"
+            "• Just type text → I speak it in your voice channel\n\n"
+            "Run `/help` anytime for the full command list."
         )
         dm_ok = True
         try:
@@ -339,24 +334,26 @@ class TTSCog(commands.Cog):
         lines = [
             "**discord-fishaudio-TTS** — text-to-speech in voice channels via Fish Audio.",
             "",
-            "**Voice commands** (whitelisted users only):",
-            "• `/join` — summon the bot to your current voice channel",
-            "• `/say <text>` — speak text (bot must be in your channel)",
-            "• `/skip` — stop the currently-playing TTS",
-            "• `/leave` — disconnect the bot",
-            "• DM the bot text → speaks in your voice channel (bot must already be there)",
+            "🎤 **In any server** (voice control)",
+            "• `/join [channel]` — summon me to a voice channel",
+            "• `/say <text>` — I speak (I must be in your voice channel — `/join` first)",
+            "• `/leave` — I disconnect from voice",
+            "• `/skip` — stop the current TTS",
             "",
-            "**Voice config:**",
-            "• `/voice show` — current Fish Audio voice ID",
+            "💬 **In DM** (with me)",
+            "• Just type any text — I speak it in your voice channel",
+            "  (you must be in voice in a server I'm in, with me already there)",
+            "",
+            "ℹ️  **Anywhere**",
+            "• `/help` — this message",
+            "• `/voice show` — show current voice",
         ]
         if is_owner:
             lines += [
-                "• `/voice set <id>` — change the voice (owner only)",
-                "",
-                "**Whitelist (owner only):**",
-                "• `/whitelist add @user` — grant access",
-                "• `/whitelist remove @user` — revoke access",
-                "• `/whitelist list` — show current whitelist",
+                "• `/voice set <id>` — change voice *(owner)*",
+                "• `/whitelist add @user` — grant access *(owner)*",
+                "• `/whitelist remove @user` — revoke access *(owner)*",
+                "• `/whitelist list` — show whitelist *(owner)*",
             ]
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
