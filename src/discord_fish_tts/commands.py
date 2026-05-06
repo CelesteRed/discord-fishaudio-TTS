@@ -11,10 +11,17 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
+import time
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
+
+# Catches messages that look like a slash command typed as text
+# (e.g. "/help" or "/say hello"). Lets users type things starting
+# with a single non-alpha character through ("/dev/null", "//path").
+_SLASH_TEXT_RE = re.compile(r'^\s*/[a-zA-Z]\w*')
 
 from .config_store import ConfigStore
 from .tts_pipeline import PipelineRegistry, TTSJob
@@ -33,6 +40,7 @@ class TTSCog(commands.Cog):
         config_store: ConfigStore,
         owner_id_provider,  # () -> int | None — late-bound (owner known after on_ready)
         max_text_len: int,
+        idle_timeout_s: int = 300,
     ) -> None:
         self.bot = bot
         self.voice_manager = voice_manager
@@ -40,6 +48,55 @@ class TTSCog(commands.Cog):
         self.config = config_store
         self._owner_id_provider = owner_id_provider
         self.max_text_len = max_text_len
+        self._idle_timeout_s = idle_timeout_s
+        # guild_id → first time bot found itself alone in voice (epoch s)
+        self._empty_since: dict[int, float] = {}
+        if idle_timeout_s > 0:
+            self._idle_check.start()
+
+    def cog_unload(self) -> None:
+        self._idle_check.cancel()
+
+    @tasks.loop(seconds=60)
+    async def _idle_check(self) -> None:
+        """Disconnect from voice channels that have had no human listeners
+        for `_idle_timeout_s` seconds. Prevents wasted Fish API quota and
+        leftover voice connections from forgotten sessions."""
+        try:
+            now = time.time()
+            for guild in list(self.bot.guilds):
+                vc = guild.voice_client
+                if vc is None:
+                    self._empty_since.pop(guild.id, None)
+                    continue
+                # Count human (non-bot) members in the bot's channel
+                channel = vc.channel
+                humans = [m for m in channel.members if not m.bot]
+                if humans:
+                    self._empty_since.pop(guild.id, None)
+                    continue
+                first_empty = self._empty_since.get(guild.id)
+                if first_empty is None:
+                    self._empty_since[guild.id] = now
+                    continue
+                if now - first_empty >= self._idle_timeout_s:
+                    log.info(
+                        "guild %d (%s): voice channel #%s empty for %ds, leaving",
+                        guild.id, guild.name, channel.name,
+                        int(now - first_empty),
+                    )
+                    try:
+                        await vc.disconnect(force=False)
+                    except Exception:
+                        log.exception("idle disconnect failed for guild %d", guild.id)
+                    finally:
+                        self._empty_since.pop(guild.id, None)
+        except Exception:
+            log.exception("idle check loop iteration failed")
+
+    @_idle_check.before_loop
+    async def _idle_check_before(self) -> None:
+        await self.bot.wait_until_ready()
 
     # ---- helpers ----
 
@@ -124,9 +181,11 @@ class TTSCog(commands.Cog):
             return
         if bot_ch_id != user_ch.id:
             bot_ch = interaction.guild.get_channel(bot_ch_id) if interaction.guild else None
-            ch_name = bot_ch.name if bot_ch else f"#<{bot_ch_id}>"
+            ch_name = bot_ch.name if bot_ch else str(bot_ch_id)
+            guild_name = interaction.guild.name if interaction.guild else "this server"
             await interaction.response.send_message(
-                f"I'm in **#{ch_name}**. Run `/join` from your channel to bring me over.",
+                f"I'm in **#{ch_name}** of **{guild_name}**. "
+                f"Run `/join` from your channel to bring me over.",
                 ephemeral=True,
             )
             return
@@ -188,6 +247,23 @@ class TTSCog(commands.Cog):
                 "That voice channel is not in this server.", ephemeral=True,
             )
             return
+
+        # Refuse to hijack: if bot is in another channel of this guild AND
+        # currently playing, force the requester to /skip first to avoid
+        # silently teleporting audio away from listeners in that channel.
+        current_ch_id = self.voice_manager.current_channel_id(interaction.guild_id)
+        if (current_ch_id is not None and current_ch_id != target.id):
+            guild = interaction.guild
+            vc = guild.voice_client if guild else None
+            if vc is not None and vc.is_playing():
+                cur_ch = guild.get_channel(current_ch_id) if guild else None
+                cur_name = cur_ch.name if cur_ch else str(current_ch_id)
+                await interaction.response.send_message(
+                    f"I'm currently playing TTS in **#{cur_name}**. "
+                    f"Run `/skip` first if you want to move me.",
+                    ephemeral=True,
+                )
+                return
 
         await self.voice_manager.ensure_in_channel(interaction.guild_id, target.id)
         await interaction.response.send_message(f"Joined {target.name}.", ephemeral=True)
@@ -370,6 +446,15 @@ class TTSCog(commands.Cog):
             await message.reply("You are not authorized to use this bot.")
             return
 
+        # UX guard: users sometimes type "/help" as text instead of using
+        # the slash command popup. Don't speak it — guide them.
+        if _SLASH_TEXT_RE.match(message.content):
+            await message.reply(
+                "💡 That looks like a slash command typed as text. "
+                "Type `/` and pick from the popup that appears, instead."
+            )
+            return
+
         if self.config.get_voice_id() is None:
             await message.reply(
                 "No voice configured. Run `/voice set <fish_voice_id>` first."
@@ -396,9 +481,13 @@ class TTSCog(commands.Cog):
             await message.reply("I'm not in a voice channel. Use `/join` first.")
             return
         if bot_ch_id != channel_id:
+            guild = self.bot.get_guild(guild_id)
+            bot_ch = guild.get_channel(bot_ch_id) if guild else None
+            ch_name = bot_ch.name if bot_ch else str(bot_ch_id)
+            guild_name = guild.name if guild else "the server"
             await message.reply(
-                "I'm in a different voice channel. Move to mine, or use "
-                "`/leave` and `/join` from your channel."
+                f"I'm in **#{ch_name}** of **{guild_name}**. "
+                "Run `/join` from your channel there to bring me over."
             )
             return
 

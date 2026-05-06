@@ -94,6 +94,8 @@ async def amain() -> None:
         latency=os.environ.get("FISH_LATENCY", "low"),
     )
     max_text_len = int(os.environ.get("MAX_TEXT_LEN", "200"))
+    # Auto-leave voice when alone for N minutes. 0 disables.
+    idle_timeout_s = int(os.environ.get("IDLE_TIMEOUT_MINUTES", "5")) * 60
 
     intents = discord.Intents.default()
     intents.message_content = True
@@ -167,6 +169,7 @@ async def amain() -> None:
         config_store=config,
         owner_id_provider=owner_id_provider,
         max_text_len=max_text_len,
+        idle_timeout_s=idle_timeout_s,
     ))
 
     try:
