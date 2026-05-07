@@ -1,0 +1,15 @@
+services:
+  bot:
+    build: .
+    image: discord-fishaudio-tts:latest
+    container_name: discord-fishaudio-tts
+    restart: unless-stopped
+    env_file:
+      - .env.local
+    volumes:
+      - ./data:/app/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
