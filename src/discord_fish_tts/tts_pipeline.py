@@ -146,12 +146,12 @@ class GuildTTSPipeline:
                 "bot is not in the requested voice channel; /join required"
             )
 
-        # Read voice_id at job time so /voice set takes effect for queued
-        # jobs. If voice was cleared between enqueue and now, fail.
-        voice_id = self._config_store.get_voice_id()
+        # Read the voice at job time so /voice set takes effect for queued
+        # jobs: the speaker's own voice, else the default voice.
+        voice_id = self._config_store.get_voice_for(job.user_id)
         if not voice_id:
             raise RuntimeError(
-                "no voice_id configured; owner must run /voice set <id>"
+                "no voice configured; run /voice set <id> (or owner: /voice default <id>)"
             )
         fish_cfg = replace(self._fish_cfg, voice_id=voice_id)
 
