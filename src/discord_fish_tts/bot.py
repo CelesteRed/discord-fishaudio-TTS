@@ -32,6 +32,10 @@ from dotenv import load_dotenv
 
 from .commands import TTSCog
 from .config_store import ConfigStore
+from .control import start_control_server
+from .notifier import ServerNotifier
+from .text_rules import AutoCorrector, TextStore
+from .usage import UsageStore
 from .fish_client import FishConfig
 from .tts_pipeline import PipelineRegistry
 from .voice_manager import VoiceManager
@@ -44,17 +48,6 @@ def _required(name: str) -> str:
     if not val:
         raise SystemExit(f"environment variable {name} is required")
     return val
-
-
-def _int_list_env(name: str) -> list[int]:
-    """Comma/space separated Discord IDs, e.g. AUTO_TTS_CHANNELS=123,456."""
-    out: list[int] = []
-    for part in os.environ.get(name, "").replace(",", " ").split():
-        try:
-            out.append(int(part))
-        except ValueError:
-            log.warning("ignoring non-numeric id %r in %s", part, name)
-    return out
 
 
 def _migrate_legacy_env(config: ConfigStore, data_dir: Path) -> None:
@@ -94,8 +87,10 @@ async def amain() -> None:
     data_dir = Path(os.environ.get("DATA_DIR", "data"))
     config_path = data_dir / "config.json"
 
-    config = ConfigStore(config_path, default_auto_channels=_int_list_env("AUTO_TTS_CHANNELS"))
+    config = ConfigStore(config_path)
     _migrate_legacy_env(config, data_dir)
+    if config.get_server_voice() is None and os.environ.get("SERVER_VOICE_ID"):
+        config.set_server_voice(os.environ["SERVER_VOICE_ID"])
 
     # Static FishConfig parts; voice_id is dynamic per-job, read from config.
     fish_cfg = FishConfig(
@@ -123,6 +118,18 @@ async def amain() -> None:
     def owner_id_provider() -> Optional[int]:
         return state["owner_id"]
 
+    usage = UsageStore(data_dir / "usage.db")
+    text_store = TextStore(data_dir / "text.db")
+    notifier = ServerNotifier(
+        bot, registry, config, owner_id_provider,
+        fish_api_key=fish_api_key, fish_model=fish_cfg.model,
+        credit_alert_usd=float(os.environ.get("FISH_CREDIT_ALERT_USD", "1.0")),
+        usage=usage,
+        usage_budget_bytes=int(os.environ.get("USAGE_BUDGET_BYTES", "1000000")),
+    )
+    registry.error_hook = notifier.on_tts_error
+    registry.usage_hook = notifier.on_usage
+
     @bot.event
     async def on_ready() -> None:
         # Discord populates bot.application after login. Get the app owner.
@@ -143,13 +150,27 @@ async def amain() -> None:
         synced = await bot.tree.sync()
         log.info("synced %d slash commands", len(synced))
 
+        if not config.guild_gate_initialized():
+            # First run of the server gate: servers we're already in stay usable.
+            config.init_guild_gate(g.id for g in bot.guilds)
+            log.info("server gate initialised; enabled: %s", [g.name for g in bot.guilds])
+
+        if state.get("control") is None:
+            state["control"] = await start_control_server(bot, registry, voice_mgr, data_dir / "control.sock",
+                                                          notifier=notifier)
+            notifier.start()
+            cog = bot.get_cog("TTSCog")
+            if cog is not None:
+                asyncio.create_task(cog.warm_voice_titles())
+                asyncio.create_task(cog.notify_unseen_guilds())
+
         # First-run DM to owner.
         if config.is_first_run():
             try:
                 user = bot.get_user(owner_id) or await bot.fetch_user(owner_id)
                 if user is not None:
                     voice_hint = (
-                        f"✅ Default voice already set: `{config.get_voice_id()}`."
+                        f"✅ Voice already set: `{config.get_voice_id()}`."
                         if config.get_voice_id()
                         else "⚠️  **No default voice yet.** Run `/voice default <link>`, or `/voice set <link>` for yourself.\n"
                              "   (Browse voices at https://fish.audio/app/discovery)"
@@ -182,7 +203,9 @@ async def amain() -> None:
         max_text_len=max_text_len,
         idle_timeout_s=idle_timeout_s,
         fish_api_key=fish_api_key,
-        owner_contact=os.environ.get("OWNER_CONTACT"),
+        notifier=notifier,
+        text_store=text_store,
+        autocorrector=AutoCorrector(),
     ))
 
     try:
@@ -190,6 +213,8 @@ async def amain() -> None:
     finally:
         await registry.shutdown_all()
         await bot.close()
+        usage.close()
+        text_store.close()
 
 
 def cli() -> None:

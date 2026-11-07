@@ -18,6 +18,35 @@ Standalone Python Discord bot that speaks user-provided text in voice channels v
 - **Real streaming playback** — first audio plays before full synthesis completes
 - 200-char text limit
 
+## Starie build (this branch)
+
+This `starie` branch is the code running the **Starie** bot. It builds on the two upstream PRs
+(the DAVE silent-audio fix and per-user voices / `/toggle`) and adds:
+
+- **Conversation blending** — a built-in mixer lets voices overlap: a reply from someone else within
+  10 s cuts in during the last ~1.2 s of the current line (fading in while the earlier voice ducks),
+  and one person's rapid-fire messages chain into continuous speech. The next message is synthesized
+  while the current one plays.
+- **`/shortcut create | list | view | replace | delete`** — personal word/phrase replacements, shown as an id table.
+- **Auto-correct** (on by default, offline via [pyspellchecker](https://github.com/barrust/pyspellchecker)) —
+  `/auto-correct toggle | add-dictionary | remove-dictionary | dictionary | test`. Leaves `[emotion tags]`,
+  slang, names, caps and shortcut words alone.
+- **`/stop`** (owner: everyone; others: their own messages) and **`/queue`** (anyone).
+- **SERVER voice** — a system pseudo-user with its own voice for `/announce` and alerts (low API credit,
+  Fish refusing requests, monthly budget nearly used).
+- **Usage tracking** — bot status shows `Usage: N% remaining`; owner-only `/view` (every server, one
+  server, or one user with recent messages), also in DMs (or DM the bot `stats`).
+- **Server gate** — new servers stay disabled until the owner runs `/enable server:<id>` from DMs; the bot
+  DMs the owner whenever it's added. `/disable [leave:True]`, `/servers`.
+- **Auto-speak reminder** — typing in the no-mic channel with `/toggle` off gets a reminder (once an
+  hour) that edits itself when the hour is up.
+
+Deployment used for Starie: `deploy/discord-fishaudio-tts.service` (systemd, venv in
+`/opt/discord-fishaudio-tts`, unprivileged `fishtts` user) and `deploy/fishtts-setup` (prompts for the
+Discord token and Fish key with hidden input, validates both, writes `.env.local`, starts the service).
+Some Starie specifics are hard-coded: the default auto-speak channel and owner handle in
+`config_store.py` / `commands.py`, and the app ID in `deploy/fishtts-setup`.
+
 ## Setup (zero-config plugin model)
 
 Requires Python 3.11+ and a Discord bot with Message Content + Server Members intents.
@@ -89,7 +118,7 @@ For a friend-group deploy: run the host, get the welcome DM, set the voice, `/wh
 pytest -v
 ```
 
-53 tests covering Ogg demuxing (against a captured Fish output fixture), MessagePack WebSocket protocol mocking, cross-thread audio source bridging, FIFO queue with skip semantics, DAVE readiness, config persistence (per-user voices, auto-speak), chat-text cleanup, and input validation.
+98 tests covering Ogg demuxing (against a captured Fish output fixture), MessagePack WebSocket protocol mocking, cross-thread audio source bridging, FIFO queue with skip semantics, DAVE readiness, config persistence (per-user voices, auto-speak), chat-text cleanup, and input validation.
 
 ## Roadmap (v1.4+)
 

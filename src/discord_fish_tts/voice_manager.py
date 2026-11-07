@@ -62,3 +62,7 @@ class VoiceManager:
         if guild is None or guild.voice_client is None:
             return None
         return guild.voice_client.channel.id
+
+    def get_voice_client(self, guild_id: int) -> discord.VoiceClient | None:
+        guild = self._bot.get_guild(guild_id)
+        return guild.voice_client if guild is not None else None

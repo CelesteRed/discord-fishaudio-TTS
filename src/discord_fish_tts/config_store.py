@@ -29,9 +29,12 @@ from typing import Any, Iterable
 
 _VOICE_ID_RE = re.compile(r"[0-9a-f]{32}")
 
-# Seed for the auto-speak channel list when the config file has none yet
-# (bot.py passes AUTO_TTS_CHANNELS from the environment).
-DEFAULT_AUTO_TTS_CHANNELS: tuple[int, ...] = ()
+# #no-mic in Cosmiq Studio. Used when the config file has no channel list yet.
+DEFAULT_AUTO_TTS_CHANNELS: tuple[int, ...] = (1567826418329587783,)
+
+# Pseudo-user for system messages (operator/Claude relays, /announce, alerts).
+# Stored like any user voice (user_voices["0"]) so it survives default changes.
+SERVER_USER_ID = 0
 
 
 def normalize_voice_id(value: str | None) -> str | None:
@@ -62,6 +65,9 @@ class ConfigStore:
         self._user_voices: dict[int, str] = {}
         self._auto_tts_users: set[int] = set()
         self._auto_tts_channels: set[int] = set(default_auto_channels)
+        self._enabled_guilds: set[int] = set()
+        self._autocorrect_off: set[int] = set()
+        self._guild_gate_initialized = False
         self._load()
 
     # ---- whitelist ----
@@ -113,6 +119,14 @@ class ConfigStore:
         """The user's own voice, falling back to the default voice."""
         return self._user_voices.get(user_id) or self._voice_id
 
+    # ---- SERVER pseudo-user ----
+
+    def get_server_voice(self) -> str | None:
+        return self._user_voices.get(SERVER_USER_ID)
+
+    def set_server_voice(self, voice_id: str | None) -> None:
+        self.set_user_voice(SERVER_USER_ID, voice_id)
+
     # ---- auto-TTS (/toggle) ----
 
     def is_auto_tts(self, user_id: int) -> bool:
@@ -142,6 +156,52 @@ class ConfigStore:
         if channel_id not in self._auto_tts_channels:
             return False
         self._auto_tts_channels.discard(channel_id)
+        self._save()
+        return True
+
+    # ---- auto-correct (on by default) ----
+
+    def is_autocorrect(self, user_id: int) -> bool:
+        return user_id not in self._autocorrect_off
+
+    def set_autocorrect(self, user_id: int, enabled: bool) -> None:
+        if enabled:
+            self._autocorrect_off.discard(user_id)
+        else:
+            self._autocorrect_off.add(user_id)
+        self._save()
+
+    # ---- server gate (/enable, /disable) ----
+
+    def guild_gate_initialized(self) -> bool:
+        return self._guild_gate_initialized
+
+    def init_guild_gate(self, guild_ids: Iterable[int]) -> None:
+        """First run of the gate: servers the bot is already in stay usable."""
+        self._enabled_guilds = set(guild_ids)
+        self._guild_gate_initialized = True
+        self._save()
+
+    def is_guild_enabled(self, guild_id: int) -> bool:
+        return guild_id in self._enabled_guilds
+
+    def list_enabled_guilds(self) -> list[int]:
+        return sorted(self._enabled_guilds)
+
+    def enable_guild(self, guild_id: int) -> bool:
+        self._guild_gate_initialized = True
+        if guild_id in self._enabled_guilds:
+            return False
+        self._enabled_guilds.add(guild_id)
+        self._save()
+        return True
+
+    def disable_guild(self, guild_id: int) -> bool:
+        self._guild_gate_initialized = True
+        if guild_id not in self._enabled_guilds:
+            self._save()
+            return False
+        self._enabled_guilds.discard(guild_id)
         self._save()
         return True
 
@@ -191,6 +251,10 @@ class ConfigStore:
         self._auto_tts_users = _int_set(data.get("auto_tts_users"))
         if "auto_tts_channels" in data:
             self._auto_tts_channels = _int_set(data.get("auto_tts_channels"))
+        self._autocorrect_off = _int_set(data.get("autocorrect_off_users"))
+        if "enabled_guilds" in data:
+            self._enabled_guilds = _int_set(data.get("enabled_guilds"))
+            self._guild_gate_initialized = True
 
     def _save(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -201,7 +265,10 @@ class ConfigStore:
             "user_voices": {str(k): v for k, v in sorted(self._user_voices.items())},
             "auto_tts_users": sorted(self._auto_tts_users),
             "auto_tts_channels": sorted(self._auto_tts_channels),
+            "autocorrect_off_users": sorted(self._autocorrect_off),
         }
+        if self._guild_gate_initialized:
+            payload["enabled_guilds"] = sorted(self._enabled_guilds)
         tmp = self._path.with_suffix(self._path.suffix + ".tmp")
         tmp.write_text(json.dumps(payload, indent=2))
         tmp.replace(self._path)

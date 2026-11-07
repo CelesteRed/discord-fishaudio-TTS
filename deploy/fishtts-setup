@@ -1,0 +1,189 @@
+#!/usr/bin/env python3
+"""Interactive setup for the Discord Fish Audio TTS bot on this VPS.
+
+Prompts (hidden input) for the Discord bot token and Fish Audio API key,
+validates both, writes them to the bot's .env.local and (re)starts the service.
+Secrets are never echoed, logged, or passed on a command line.
+"""
+import getpass
+import json
+import os
+import pwd
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+APP_ID = "1567831517256880219"
+APP_DIR = "/opt/discord-fishaudio-tts"
+ENV_PATH = f"{APP_DIR}/.env.local"
+SERVICE = "discord-fishaudio-tts"
+SVC_USER = "fishtts"
+UA = "DiscordBot (https://github.com/averatec0773/discord-fishaudio-TTS, 1.2) fishtts-setup"
+# View Channels, Send Messages, Connect, Speak, Use Application Commands
+INVITE_PERMS = 1024 + 2048 + (1 << 20) + (1 << 21) + (1 << 31)
+
+GREEN, RED, YELLOW, BOLD, END = "\033[32m", "\033[31m", "\033[33m", "\033[1m", "\033[0m"
+
+
+def ok(msg): print(f"  {GREEN}✔{END} {msg}")
+def bad(msg): print(f"  {RED}✘{END} {msg}")
+def warn(msg): print(f"  {YELLOW}!{END} {msg}")
+
+
+def read_env() -> list[str]:
+    try:
+        with open(ENV_PATH) as f:
+            return f.read().splitlines()
+    except FileNotFoundError:
+        return []
+
+
+def env_get(lines, key):
+    for line in lines:
+        if line.startswith(f"{key}="):
+            return line.split("=", 1)[1].strip()
+    return ""
+
+
+def env_set(lines, key, value):
+    for i, line in enumerate(lines):
+        if line.startswith(f"{key}="):
+            lines[i] = f"{key}={value}"
+            return lines
+    lines.append(f"{key}={value}")
+    return lines
+
+
+def http(method, url, headers=None, body=None, timeout=20):
+    req = urllib.request.Request(url, data=body, method=method, headers={"User-Agent": UA, **(headers or {})})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+    except Exception as e:  # network failure
+        return 0, str(e).encode()
+
+
+def ask_secret(label, current):
+    hint = " (press Enter to keep the saved one)" if current else ""
+    while True:
+        val = getpass.getpass(f"{BOLD}{label}{END}{hint}: ").strip().strip('"').strip("'")
+        if val:
+            return val
+        if current:
+            return current
+        print("  value required")
+
+
+def check_discord(token) -> bool:
+    status, raw = http("GET", "https://discord.com/api/v10/applications/@me", {"Authorization": f"Bot {token}"})
+    if status == 401:
+        bad("Discord rejected the token (401). Reset it in the Developer Portal → Bot → Reset Token.")
+        return False
+    if status != 200:
+        bad(f"Discord check failed (HTTP {status}): {raw[:200]!r}")
+        return False
+    app = json.loads(raw)
+    if app.get("id") != APP_ID:
+        bad(f"Token belongs to a different app ({app.get('name')} / {app.get('id')}), expected {APP_ID}.")
+        return False
+    ok(f"Discord token valid for app '{app.get('name')}' ({APP_ID})")
+    flags = int(app.get("flags") or 0)
+    members = bool(flags & ((1 << 14) | (1 << 15)))
+    content = bool(flags & ((1 << 18) | (1 << 19)))
+    missing = [n for n, on in (("SERVER MEMBERS INTENT", members), ("MESSAGE CONTENT INTENT", content)) if not on]
+    if missing:
+        bad("Privileged intents not enabled: " + ", ".join(missing))
+        print(f"    Enable them at https://discord.com/developers/applications/{APP_ID}/bot → Privileged Gateway Intents,")
+        print("    click Save Changes, then run this setup again (the bot cannot log in without them).")
+        return False
+    ok("Server Members + Message Content intents enabled")
+    return True
+
+
+def check_fish(key, model) -> bool:
+    body = json.dumps({"text": "Setup check.", "format": "mp3"}).encode()
+    status, raw = http("POST", "https://api.fish.audio/v1/tts",
+                       {"Authorization": f"Bearer {key}", "Content-Type": "application/json", "model": model}, body, 45)
+    if status == 200 and len(raw) > 1000:
+        ok(f"Fish Audio key valid; test synthesis with model '{model}' succeeded ({len(raw)} bytes)")
+        return True
+    if status == 401:
+        bad("Fish Audio rejected the API key (401). Create one at https://fish.audio/app/api-keys/")
+    elif status == 402:
+        bad(f"Fish Audio says no API credit for model '{model}' (402). Use s2.1-pro-free or add credit.")
+    else:
+        bad(f"Fish Audio check failed (HTTP {status}): {raw[:200]!r}")
+    return False
+
+
+def main():
+    if os.geteuid() != 0:
+        sys.exit("run as root")
+    print(f"\n{BOLD}Discord Fish Audio TTS — setup{END}  (input is hidden)\n")
+    lines = read_env()
+    model = env_get(lines, "FISH_MODEL") or "s2.1-pro-free"
+
+    token = ask_secret("Discord bot token", env_get(lines, "DISCORD_TOKEN"))
+    discord_ok = check_discord(token)
+    key = ask_secret("Fish Audio API key", env_get(lines, "FISH_AUDIO_API_KEY"))
+    fish_ok = check_fish(key, model)
+
+    for k, v in (("DISCORD_TOKEN", token), ("FISH_AUDIO_API_KEY", key), ("FISH_MODEL", model)):
+        lines = env_set(lines, k, v)
+    old_umask = os.umask(0o077)
+    tmp = ENV_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    os.umask(old_umask)
+    pw = pwd.getpwnam(SVC_USER)
+    os.chown(tmp, pw.pw_uid, pw.pw_gid)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, ENV_PATH)
+    ok(f"Saved to {ENV_PATH} (mode 600, owner {SVC_USER})")
+
+    if not (discord_ok and fish_ok):
+        print(f"\n{RED}Not starting the bot until the problems above are fixed.{END} Re-run: fishtts-setup\n")
+        sys.exit(1)
+
+    subprocess.run(["systemctl", "enable", SERVICE], check=True, capture_output=True)
+    subprocess.run(["systemctl", "restart", SERVICE], check=True)
+    print("  starting bot…")
+    since = time.time()
+    online = False
+    for _ in range(20):
+        time.sleep(1.5)
+        if subprocess.run(["systemctl", "is-active", "--quiet", SERVICE]).returncode != 0:
+            break
+        log = subprocess.run(["journalctl", "-u", SERVICE, "--since", f"@{int(since) - 1}", "--no-pager", "-o", "cat"],
+                             capture_output=True, text=True).stdout
+        if "logged in as" in log.lower():
+            online = True
+            break
+    log = subprocess.run(["journalctl", "-u", SERVICE, "--since", f"@{int(since) - 1}", "--no-pager", "-o", "cat"],
+                         capture_output=True, text=True).stdout.strip().splitlines()
+    print("\n  --- recent bot log ---")
+    for line in log[-15:]:
+        print("  " + line)
+    print()
+    if online:
+        ok(f"{BOLD}Bot is online.{END} Check your Discord DMs for the welcome message.")
+    elif subprocess.run(["systemctl", "is-active", "--quiet", SERVICE]).returncode == 0:
+        warn(f"Service is running; watch it with: journalctl -u {SERVICE} -f")
+    else:
+        bad(f"Service stopped. Full log: journalctl -u {SERVICE} -n 50 --no-pager")
+        sys.exit(1)
+    print(f"\n  Next in Discord: /voice set <fish voice id>, /whitelist add @user, /join, /say hello")
+    print(f"  Re-invite / fix permissions: https://discord.com/oauth2/authorize?client_id={APP_ID}"
+          f"&scope=bot+applications.commands&permissions={INVITE_PERMS}\n")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\naborted")
+        sys.exit(130)

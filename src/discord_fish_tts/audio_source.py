@@ -47,3 +47,38 @@ class StreamingOpusAudioSource(discord.AudioSource):
 
     def cleanup(self) -> None:
         self._eof = True
+
+
+class StreamingPCMAudioSource(discord.AudioSource):
+    """Decodes Fish's Opus packets to 48 kHz stereo PCM so discord.py re-encodes
+    them with its own encoder (the standard path most bots use). Needs libopus."""
+
+    _FRAME = 3840  # 20 ms * 48 kHz * 2 ch * 2 bytes
+
+    def __init__(self, frame_queue: "_queue.Queue[Optional[bytes]]") -> None:
+        from discord.opus import Decoder, is_loaded, load_opus
+        if not is_loaded():
+            import ctypes.util
+            load_opus(ctypes.util.find_library("opus") or "libopus.so.0")
+        self._queue = frame_queue
+        self._decoder = Decoder()
+        self._eof = False
+
+    def is_opus(self) -> bool:
+        return False
+
+    def read(self) -> bytes:
+        if self._eof:
+            return b""
+        try:
+            item = self._queue.get(timeout=_READ_BUDGET_S)
+        except _queue.Empty:
+            return b"\x00" * self._FRAME
+        if item is None:
+            self._eof = True
+            return b""
+        pcm = self._decoder.decode(item, fec=False)
+        return pcm[: self._FRAME].ljust(self._FRAME, b"\x00")
+
+    def cleanup(self) -> None:
+        self._eof = True

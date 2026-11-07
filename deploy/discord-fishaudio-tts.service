@@ -1,0 +1,21 @@
+[Unit]
+Description=Discord Fish Audio TTS bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=fishtts
+Group=fishtts
+WorkingDirectory=/opt/discord-fishaudio-tts
+ExecStart=/opt/discord-fishaudio-tts/.venv/bin/discord-fish-tts
+Restart=on-failure
+RestartSec=10
+MemoryMax=300M
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/discord-fishaudio-tts/data
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

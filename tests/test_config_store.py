@@ -121,7 +121,8 @@ def test_save_format(tmp_path: Path):
         "first_run_done": True,
         "user_voices": {},
         "auto_tts_users": [],
-        "auto_tts_channels": [],
+        "auto_tts_channels": [1567826418329587783],
+        "autocorrect_off_users": [],
     }
 
 
