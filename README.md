@@ -36,8 +36,12 @@ This `starie` branch is the code running the **Starie** bot. It builds on the tw
   Fish refusing requests, monthly budget nearly used).
 - **Usage tracking** — bot status shows `Usage: N% remaining`; owner-only `/view` (every server, one
   server, or one user with recent messages), also in DMs (or DM the bot `stats`).
-- **Server gate** — new servers stay disabled until the owner runs `/enable server:<id>` from DMs; the bot
-  DMs the owner whenever it's added. `/disable [leave:True]`, `/servers`.
+- **Server gate** — new servers stay disabled until the owner enables them; the bot DMs the owner whenever
+  it's added. `/servers list | view | enable | disable [leave:True]` (works from DMs, accepts names or IDs).
+- **Per-server `/config`** (server admins with Manage Server, plus the bot owner) — auto-speak channels
+  (several per server, text or voice-channel chat), the auto-speak and auto-correct defaults for members
+  who haven't chosen, and a server voice. Voice order: the member's own voice, then the server voice, then
+  the global default. Members can return to the server default with `/toggle default`.
 - **Auto-speak reminder** — typing in the no-mic channel with `/toggle` off gets a reminder (once an
   hour) that edits itself when the hour is up.
 

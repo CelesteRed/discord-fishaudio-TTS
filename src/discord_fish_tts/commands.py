@@ -55,7 +55,7 @@ def _fold(name: str) -> str:
     """Server-name matching that ignores case, emoji and punctuation."""
     return " ".join("".join(c.lower() if c.isalnum() else " " for c in name).split())  # "auto-speak is off" reminder, per user
 # Owner commands that still work inside a server that isn't enabled yet.
-GATE_EXEMPT_COMMANDS = {"enable", "disable", "servers", "view"}
+GATE_EXEMPT_COMMANDS = {"servers", "view"}
 OWNER_HANDLE = "@CelesteRed"
 
 
@@ -210,8 +210,12 @@ class TTSCog(commands.Cog):
                 fallback = fallback or (guild.id, member.voice.channel.id)
         return fallback
 
-    def _channels_text(self) -> str:
+    def _channels_text(self, guild_id: int | None = None) -> str:
+        """Auto-speak channels, limited to one server when guild_id is given."""
         chans = self.config.list_auto_tts_channels()
+        if guild_id is not None:
+            guild = self.bot.get_guild(guild_id)
+            chans = [c for c in chans if guild is not None and guild.get_channel(c) is not None]
         return ", ".join(f"<#{c}>" for c in chans) if chans else "*(no auto-speak channels set)*"
 
     async def _lookup_voice(self, voice_id: str) -> tuple[bool | None, str | None]:
@@ -255,14 +259,15 @@ class TTSCog(commands.Cog):
 
     # ---- /say ----
 
-    def _prepare_text(self, user_id: int, text: str) -> tuple[str, list[tuple[str, str]], list[int]]:
+    def _prepare_text(self, user_id: int, text: str,
+                      guild_id: int | None = None) -> tuple[str, list[tuple[str, str]], list[int]]:
         """Auto-correct (if on for this person), then their shortcuts. Returns
         (text to speak, [(misspelling, fix)], [shortcut ids used])."""
         if self.text_store is None:
             return text, [], []
         shortcuts = self.text_store.shortcuts(user_id)
         fixes: list[tuple[str, str]] = []
-        if self.autocorrector is not None and self.config.is_autocorrect(user_id):
+        if self.autocorrector is not None and self.config.is_autocorrect(user_id, guild_id):
             protected = self.text_store.dictionary() | self.text_store.all_shortcut_words()
             try:
                 text, fixes = self.autocorrector.correct(text, protected)
@@ -292,7 +297,7 @@ class TTSCog(commands.Cog):
             await interaction.response.send_message("Run /say from a server.", ephemeral=True)
             return
 
-        if self.config.get_voice_for(interaction.user.id) is None:
+        if self.config.get_voice_for(interaction.user.id, interaction.guild_id) is None:
             await interaction.response.send_message(
                 f"No voice set. Pick one with `/voice set <link>` — browse voices at <{VOICE_LIBRARY_URL}>.",
                 ephemeral=True,
@@ -326,7 +331,7 @@ class TTSCog(commands.Cog):
             )
             return
 
-        text, fixes, _ = self._prepare_text(interaction.user.id, text)
+        text, fixes, _ = self._prepare_text(interaction.user.id, text, interaction.guild_id)
         pipeline = self.registry.get_or_create(interaction.guild_id)  # type: ignore[arg-type]
         try:
             await pipeline.enqueue(TTSJob(
@@ -433,26 +438,32 @@ class TTSCog(commands.Cog):
         name="toggle",
         description="Auto-speak everything you type in the no-mic channel while you're in voice.",
     )
-    @app_commands.describe(state="on or off (leave empty to flip it)")
+    @app_commands.describe(state="on, off, or default (follow this server's setting); empty flips it")
     async def toggle(self, interaction: discord.Interaction,
-                     state: Literal["on", "off"] | None = None) -> None:
+                     state: Literal["on", "off", "default"] | None = None) -> None:
         if await self._deny_if_not_allowed(interaction):
             return
         uid = interaction.user.id
-        enabled = (not self.config.is_auto_tts(uid)) if state is None else (state == "on")
-        self.config.set_auto_tts(uid, enabled)
+        gid = interaction.guild_id
+        if state == "default":
+            self.config.set_auto_tts(uid, None)
+        else:
+            self.config.set_auto_tts(uid, (not self.config.is_auto_tts(uid, gid)) if state is None else state == "on")
+        enabled = self.config.is_auto_tts(uid, gid)
         log.info("/toggle: %s auto-speak %s", interaction.user, "on" if enabled else "off")
         if enabled:
-            voice = await self._voice_label(self.config.get_voice_for(uid))
+            voice = await self._voice_label(self.config.get_voice_for(uid, gid))
             msg = (
-                f"🔊 Auto-speak **on**. Messages you type in {self._channels_text()} are spoken "
+                f"🔊 Auto-speak **on**. Messages you type in {self._channels_text(gid)} are spoken "
                 f"while you're in a voice channel (I'll join you if I'm not in voice yet).\n"
                 f"Your voice: {voice}. Run `/toggle off` to turn it off."
             )
-            if self.config.get_voice_for(uid) is None:
+            if self.config.get_voice_for(uid, gid) is None:
                 msg += f"\n⚠️ You have no voice yet — `/voice set <link>` (browse <{VOICE_LIBRARY_URL}>)."
         else:
             msg = "🔇 Auto-speak **off**."
+        if state == "default":
+            msg += " *(following this server's default — `/toggle on` or `/toggle off` to choose yourself)*"
         await interaction.response.send_message(msg, ephemeral=True)
         if enabled:
             # Turning it on ends the cooldown: their reminders now say "will remind you next time".
@@ -478,11 +489,14 @@ class TTSCog(commands.Cog):
         lines = [
             f"Your voice: {await self._voice_label(mine) if mine else '*(not set — using the default)*'}",
             f"Default voice: {await self._voice_label(default)}",
-            f"Auto-speak (`/toggle`): **{'on' if self.config.is_auto_tts(uid) else 'off'}**",
+            f"Server default voice: {await self._voice_label(self.config.guild_default_voice(interaction.guild_id))}"
+            if interaction.guild_id and self.config.guild_default_voice(interaction.guild_id) else None,
+            f"Auto-speak (`/toggle`): **{'on' if self.config.is_auto_tts(uid, interaction.guild_id) else 'off'}**"
+            + (" *(server default)*" if self.config.auto_tts_choice(uid) is None else ""),
         ]
         if self._is_owner(uid):
             lines.append(f"SERVER voice: {await self._voice_label(self.config.get_server_voice())}")
-        await interaction.response.send_message("\n".join(lines), ephemeral=True)
+        await interaction.response.send_message("\n".join(l for l in lines if l), ephemeral=True)
 
     @voice_group.command(name="set", description="Set YOUR voice (paste a fish.audio voice link or ID).")
     @app_commands.describe(voice="fish.audio voice link (…/app/m/<id>) or the voice ID")
@@ -585,35 +599,112 @@ class TTSCog(commands.Cog):
                 ephemeral=True,
             )
 
-    # ---- /ttschannel ----
+    # ---- /config: per-server settings (server admins + bot owner) ----
 
-    ttschannel_group = app_commands.Group(
-        name="ttschannel",
-        description="Channels where /toggle auto-speak listens (owner only).",
+    config_group = app_commands.Group(
+        name="config",
+        description="This server's settings for the bot (server admins).",
         guild_only=True,
+        default_permissions=discord.Permissions(manage_guild=True),
     )
 
-    @ttschannel_group.command(name="add", description="Let /toggle auto-speak work in a text channel.")
-    async def ttschannel_add(self, interaction: discord.Interaction, channel: discord.TextChannel) -> None:
-        if await self._deny_if_not_owner(interaction):
+    def _can_configure(self, interaction: discord.Interaction) -> bool:
+        if self._is_owner(interaction.user.id):
+            return True
+        perms = getattr(interaction.user, "guild_permissions", None)
+        return bool(perms and (perms.manage_guild or perms.administrator))
+
+    async def _deny_if_cannot_configure(self, interaction: discord.Interaction) -> bool:
+        if self._can_configure(interaction):
+            return False
+        await interaction.response.send_message(
+            "Only this server's admins (**Manage Server** permission) can change these settings.", ephemeral=True)
+        return True
+
+    async def _config_embed(self, guild_id: int) -> discord.Embed:
+        guild = self.bot.get_guild(guild_id)
+        g = self.config
+        server_voice = g.guild_default_voice(guild_id)
+        fallback = await self._voice_label(g.get_voice_id())
+        lines = [
+            f"**Auto-speak channels:** {self._channels_text(guild_id)}",
+            f"**Auto-speak default:** {'on' if g.guild_setting(guild_id, 'auto_speak_default', False) else 'off'}"
+            " — for members who haven't run `/toggle on|off`",
+            f"**Auto-correct default:** {'on' if g.guild_setting(guild_id, 'autocorrect_default', True) else 'off'}"
+            " — for members who haven't run `/auto-correct toggle`",
+            f"**Server voice:** {await self._voice_label(server_voice) if server_voice else f'*not set* — using {fallback}'}"
+            " — for members without their own `/voice set`",
+            f"**Status:** {'✅ enabled' if g.is_guild_enabled(guild_id) else '⛔ not enabled by the bot owner yet'}",
+        ]
+        embed = discord.Embed(title=f"⚙️ {guild.name if guild else guild_id} — {self._bot_name()} settings",
+                              description="\n".join(lines), color=discord.Color.blurple())
+        embed.set_footer(text="/config channel-add · channel-remove · auto-speak-default · auto-correct-default · server-voice")
+        return embed
+
+    async def _config_reply(self, interaction: discord.Interaction, note: str) -> None:
+        await interaction.response.send_message(note, embed=await self._config_embed(interaction.guild_id),
+                                                ephemeral=True)
+
+    @config_group.command(name="show", description="Show this server's settings.")
+    async def config_show(self, interaction: discord.Interaction) -> None:
+        await interaction.response.send_message(embed=await self._config_embed(interaction.guild_id), ephemeral=True)
+
+    @config_group.command(name="channel-add", description="Make a channel an auto-speak channel (you can have several).")
+    @app_commands.describe(channel="Text channel, or a voice channel's chat")
+    async def config_channel_add(self, interaction: discord.Interaction,
+                                 channel: discord.TextChannel | discord.VoiceChannel) -> None:
+        if await self._deny_if_cannot_configure(interaction):
             return
         added = self.config.add_auto_tts_channel(channel.id)
-        msg = f"Added {channel.mention}." if added else f"{channel.mention} is already an auto-speak channel."
-        await interaction.response.send_message(f"{msg}\nAuto-speak channels: {self._channels_text()}", ephemeral=True)
+        log.info("/config: %s added auto-speak channel #%s in %s", interaction.user, channel.name, interaction.guild_id)
+        await self._config_reply(interaction, f"✅ {channel.mention} is now an auto-speak channel." if added
+                                 else f"{channel.mention} is already an auto-speak channel.")
 
-    @ttschannel_group.command(name="remove", description="Stop /toggle auto-speak in a text channel.")
-    async def ttschannel_remove(self, interaction: discord.Interaction, channel: discord.TextChannel) -> None:
-        if await self._deny_if_not_owner(interaction):
+    @config_group.command(name="channel-remove", description="Stop auto-speak in a channel.")
+    @app_commands.describe(channel="The channel to remove")
+    async def config_channel_remove(self, interaction: discord.Interaction,
+                                    channel: discord.TextChannel | discord.VoiceChannel) -> None:
+        if await self._deny_if_cannot_configure(interaction):
             return
         removed = self.config.remove_auto_tts_channel(channel.id)
-        msg = f"Removed {channel.mention}." if removed else f"{channel.mention} wasn't an auto-speak channel."
-        await interaction.response.send_message(f"{msg}\nAuto-speak channels: {self._channels_text()}", ephemeral=True)
+        await self._config_reply(interaction, f"Removed {channel.mention}." if removed
+                                 else f"{channel.mention} wasn't an auto-speak channel.")
 
-    @ttschannel_group.command(name="list", description="List auto-speak channels.")
-    async def ttschannel_list(self, interaction: discord.Interaction) -> None:
-        if await self._deny_if_not_owner(interaction):
+    @config_group.command(name="auto-speak-default", description="Auto-speak on or off for members who haven't chosen.")
+    async def config_auto_speak_default(self, interaction: discord.Interaction, state: Literal["on", "off"]) -> None:
+        if await self._deny_if_cannot_configure(interaction):
             return
-        await interaction.response.send_message(f"Auto-speak channels: {self._channels_text()}", ephemeral=True)
+        self.config.set_guild_setting(interaction.guild_id, "auto_speak_default", state == "on")
+        await self._config_reply(interaction, f"Auto-speak default is now **{state}** in this server. "
+                                              "Members who picked `/toggle on` or `/toggle off` keep their choice.")
+
+    @config_group.command(name="auto-correct-default", description="Auto-correct on or off for members who haven't chosen.")
+    async def config_auto_correct_default(self, interaction: discord.Interaction, state: Literal["on", "off"]) -> None:
+        if await self._deny_if_cannot_configure(interaction):
+            return
+        self.config.set_guild_setting(interaction.guild_id, "autocorrect_default", state == "on")
+        await self._config_reply(interaction, f"Auto-correct default is now **{state}** in this server.")
+
+    @config_group.command(name="server-voice", description="Default voice in this server (leave empty to clear).")
+    @app_commands.describe(voice="fish.audio voice link or ID; empty = use the bot's global default")
+    async def config_server_voice(self, interaction: discord.Interaction, voice: str | None = None) -> None:
+        if await self._deny_if_cannot_configure(interaction):
+            return
+        if not voice or not voice.strip():
+            self.config.set_guild_default_voice(interaction.guild_id, None)
+            await self._config_reply(interaction, "Server voice cleared.")
+            return
+        vid = normalize_voice_id(voice)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        exists, title = await self._lookup_voice(vid)
+        if exists is False:
+            await interaction.followup.send(f"❌ Fish Audio has no voice `{vid}`. Browse <{VOICE_LIBRARY_URL}>.",
+                                            ephemeral=True)
+            return
+        self.config.set_guild_default_voice(interaction.guild_id, vid)
+        log.info("/config: %s set server voice %s (%s) in %s", interaction.user, vid, title, interaction.guild_id)
+        await interaction.followup.send(f"✅ Server voice is now {f'**{title}**' if title else f'`{vid}`'}.",
+                                        embed=await self._config_embed(interaction.guild_id), ephemeral=True)
 
     # ---- /whitelist ----
 
@@ -920,7 +1011,7 @@ class TTSCog(commands.Cog):
                 embed.set_thumbnail(url=user.display_avatar.url)
             embed.description = (
                 f"<@{uid}> · `{user.name if user else '?'}` · ID `{uid}`\n"
-                f"Access: {access} · Auto-speak: **{'on' if self.config.is_auto_tts(uid) else 'off'}**\n"
+                f"Access: {access} · Auto-speak: **{({True: 'on', False: 'off'}).get(self.config.auto_tts_choice(uid), 'server default')}**\n"
                 f"Voice: {voice}"
             )
 
@@ -1083,8 +1174,8 @@ class TTSCog(commands.Cog):
                 f"Added by: {inviter.mention + f' (`{inviter.name}`)' if inviter else '*unknown (no audit-log access)*'}\n"
                 f"Server created <t:{int(guild.created_at.timestamp())}:R>\n\n"
                 + ("✅ Already enabled." if enabled else
-                   f"⛔ **Disabled.** Nobody can use me there until you run\n`/enable server:{guild.id}`\n"
-                   f"Or `/disable server:{guild.id} leave:True` to make me leave.")
+                   f"⛔ **Disabled.** Nobody can use me there until you run\n`/servers enable server:{guild.id}`\n"
+                   f"Or `/servers disable server:{guild.id} leave:True` to make me leave.")
             ),
         )
         if guild.icon:
@@ -1135,7 +1226,7 @@ class TTSCog(commands.Cog):
         return (partial[0], []) if len(partial) == 1 else (None, partial)
 
     async def _gate_target(self, interaction: discord.Interaction, server: str) -> discord.Guild | int | None:
-        """Resolve /enable or /disable's server argument, replying when it can't."""
+        """Resolve /servers enable|disable's server argument, replying when it can't."""
         guild, candidates = self._resolve_guild(server)
         if guild is not None:
             return guild
@@ -1154,11 +1245,16 @@ class TTSCog(commands.Cog):
             f"Add me as a bot: <{self.invite_url(gid)}>", ephemeral=True)
         return None
 
-    @app_commands.command(name="enable", description="Allow the bot to be used in a server (owner only).")
-    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+    servers_group = app_commands.Group(
+        name="servers",
+        description="Every server the bot is in: list, enable, disable (owner only).",
+        allowed_contexts=app_commands.AppCommandContext(guild=True, dm_channel=True, private_channel=True),
+    )
+
+    @servers_group.command(name="enable", description="Allow the bot to be used in a server (owner only).")
     @app_commands.describe(server="Server name or ID (pick from the list)")
     @app_commands.autocomplete(server=_enable_autocomplete)
-    async def enable(self, interaction: discord.Interaction, server: str) -> None:
+    async def servers_enable(self, interaction: discord.Interaction, server: str) -> None:
         if await self._deny_if_not_owner(interaction):
             return
         guild = await self._gate_target(interaction, server)
@@ -1178,11 +1274,10 @@ class TTSCog(commands.Cog):
             f"✅ Enabled in **{guild.name}** (`{guild.id}`)." if changed
             else f"Already enabled in **{guild.name}**.", ephemeral=True)
 
-    @app_commands.command(name="disable", description="Block the bot in a server, optionally leaving it (owner only).")
-    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+    @servers_group.command(name="disable", description="Block the bot in a server, optionally leaving it (owner only).")
     @app_commands.describe(server="Server name or ID (pick from the list)", leave="Also make the bot leave that server")
     @app_commands.autocomplete(server=_disable_autocomplete)
-    async def disable(self, interaction: discord.Interaction, server: str, leave: bool = False) -> None:
+    async def servers_disable(self, interaction: discord.Interaction, server: str, leave: bool = False) -> None:
         if await self._deny_if_not_owner(interaction):
             return
         guild = await self._gate_target(interaction, server)
@@ -1203,11 +1298,17 @@ class TTSCog(commands.Cog):
             await interaction.response.send_message(msg + " Leaving the server now.", ephemeral=True)
             await guild.leave()
             return
-        await interaction.response.send_message(msg + f" Re-enable with `/enable server:{guild.id}`.", ephemeral=True)
+        await interaction.response.send_message(msg + f" Re-enable with `/servers enable server:{guild.id}`.", ephemeral=True)
 
-    @app_commands.command(name="servers", description="List every server the bot is in and whether it's enabled (owner only).")
-    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-    async def servers(self, interaction: discord.Interaction) -> None:
+    @servers_group.command(name="list", description="Every server the bot is in, enabled or not (owner only).")
+    async def servers_list(self, interaction: discord.Interaction) -> None:
+        await self._servers_overview(interaction)
+
+    @servers_group.command(name="view", description="Every server the bot is in, enabled or not (owner only).")
+    async def servers_view(self, interaction: discord.Interaction) -> None:
+        await self._servers_overview(interaction)
+
+    async def _servers_overview(self, interaction: discord.Interaction) -> None:
         if await self._deny_if_not_owner(interaction):
             return
         guilds = self.bot.guilds
@@ -1217,7 +1318,7 @@ class TTSCog(commands.Cog):
                      f"**{g.name}** · `{g.id}`\n   {self._guild_status(g)}" for g in sorted(enabled, key=lambda g: g.name.lower()))
                      or "*none*"),
                  f"**⛔ Not enabled ({len(disabled)})**\n" + ("\n".join(
-                     f"**{g.name}** · `{g.id}`\n   {self._guild_status(g)} · `/enable server:{g.id}`"
+                     f"**{g.name}** · `{g.id}`\n   {self._guild_status(g)} · `/servers enable server:{g.id}`"
                      for g in sorted(disabled, key=lambda g: g.name.lower())) or "*none*")]
         cmd_only = self._commands_only_guilds()
         if cmd_only:
@@ -1227,7 +1328,7 @@ class TTSCog(commands.Cog):
                 for gid, ts in sorted(cmd_only.items(), key=lambda kv: -kv[1])))
         embed = discord.Embed(title=f"🌐 {self._bot_name()} is in {len(guilds)} server(s)",
                               description="\n\n".join(parts)[:4096], color=discord.Color.blurple())
-        embed.set_footer(text="/enable server:<name or ID> · /disable server:… [leave:True]")
+        embed.set_footer(text="/servers enable server:<name or ID> · /servers disable server:… [leave:True]")
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     # ---- /stop and /queue ----
@@ -1406,14 +1507,17 @@ class TTSCog(commands.Cog):
     )
 
     @autocorrect_group.command(name="toggle", description="Turn auto-correct on or off for your messages.")
-    @app_commands.describe(state="on or off (leave empty to flip it)")
+    @app_commands.describe(state="on, off, or default (follow this server's setting); empty flips it")
     async def autocorrect_toggle(self, interaction: discord.Interaction,
-                                 state: Literal["on", "off"] | None = None) -> None:
+                                 state: Literal["on", "off", "default"] | None = None) -> None:
         if not await self._text_store_ready(interaction):
             return
-        uid = interaction.user.id
-        enabled = (not self.config.is_autocorrect(uid)) if state is None else state == "on"
-        self.config.set_autocorrect(uid, enabled)
+        uid, gid = interaction.user.id, interaction.guild_id
+        if state == "default":
+            self.config.set_autocorrect(uid, None)
+        else:
+            self.config.set_autocorrect(uid, (not self.config.is_autocorrect(uid, gid)) if state is None else state == "on")
+        enabled = self.config.is_autocorrect(uid, gid)
         await interaction.response.send_message(
             "✅ Auto-correct **on** — I'll fix clear misspellings before speaking." if enabled
             else "Auto-correct **off** — I'll say exactly what you type.", ephemeral=True)
@@ -1466,10 +1570,10 @@ class TTSCog(commands.Cog):
     async def autocorrect_test(self, interaction: discord.Interaction, text: str) -> None:
         if not await self._text_store_ready(interaction):
             return
-        out, fixes, used = self._prepare_text(interaction.user.id, text[:self.max_text_len])
+        out, fixes, used = self._prepare_text(interaction.user.id, text[:self.max_text_len], interaction.guild_id)
         lines = [f"**I'd say:** {discord.utils.escape_mentions(out)}"]
         lines.append("**Fixed:** " + (", ".join(f"*{a}* → *{b}*" for a, b in fixes) if fixes else "nothing")
-                     + ("" if self.config.is_autocorrect(interaction.user.id) else " (auto-correct is off for you)"))
+                     + ("" if self.config.is_autocorrect(interaction.user.id, interaction.guild_id) else " (auto-correct is off for you)"))
         if used:
             lines.append("**Shortcuts used:** " + ", ".join(f"#{i}" for i in used))
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
@@ -1503,7 +1607,8 @@ class TTSCog(commands.Cog):
             "• Auto-correct fixes typos (on by default): `/auto-correct toggle` · `/auto-correct add-dictionary <word>` · `/auto-correct test <text>`",
             "",
             "⌨️ **No mic?**",
-            f"• `/toggle on` / `/toggle off` — auto-speak everything you type in {self._channels_text()} while you're in voice",
+            f"• `/toggle on` / `/toggle off` / `/toggle default` — auto-speak everything you type in "
+            f"{self._channels_text(interaction.guild_id)} while you're in voice",
             "",
             "💬 **DM me** any text and I'll speak it in your voice channel (I must already be there)",
         ]
@@ -1516,10 +1621,10 @@ class TTSCog(commands.Cog):
                 "• `/stop` — stops **everyone** (in DMs: every server)",
                 "• `/view` — usage across every server · `/view server:…` · `/view user:…` — stats + recent messages",
                 "• DM me `stats` for the every-server report (works from anywhere)",
-                "• `/servers` — every server I'm in · `/enable server:…` · `/disable server:… [leave:True]`",
-                "  (new servers stay disabled until you `/enable` them — I DM you when I'm added)",
+                "• `/servers list` — every server I'm in · `/servers enable server:…` · `/servers disable server:… [leave:True]`",
+                "  (new servers stay disabled until you enable them — I DM you when I'm added)",
                 "• `/whitelist add|remove @user` · `/whitelist list`",
-                "• `/ttschannel add|remove #channel` · `/ttschannel list` — where `/toggle` works",
+                "• `/config` (also for each server's admins) — auto-speak channels, defaults, server voice",
             ]
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
@@ -1544,7 +1649,7 @@ class TTSCog(commands.Cog):
             return
         if not self._is_allowed(member.id):
             return
-        if not self.config.is_auto_tts(member.id):
+        if not self.config.is_auto_tts(member.id, message.guild.id):
             await self._maybe_remind_toggle_off(message)
             return
         user_ch = self._user_voice_channel(member)
@@ -1552,7 +1657,7 @@ class TTSCog(commands.Cog):
             return  # toggle only works while the user is in voice
         if _SLASH_TEXT_RE.match(message.content):
             return
-        if self.config.get_voice_for(member.id) is None:
+        if self.config.get_voice_for(member.id, message.guild.id) is None:
             return
         text = speakable_text(message.clean_content, self.max_text_len)
         if not text:
@@ -1561,7 +1666,7 @@ class TTSCog(commands.Cog):
             # Tell them it was cut instead of silently stopping mid-sentence.
             with contextlib.suppress(discord.HTTPException):
                 await message.add_reaction("✂️")
-        text, _, _ = self._prepare_text(member.id, text)
+        text, _, _ = self._prepare_text(member.id, text, message.guild.id)
 
         guild = message.guild
         lock = self._join_locks.setdefault(guild.id, asyncio.Lock())
@@ -1693,7 +1798,6 @@ class TTSCog(commands.Cog):
         except ValidationError as e:
             await message.reply(str(e))
             return
-        text, _, _ = self._prepare_text(message.author.id, text)
 
         found = self._find_user_voice_anywhere(message.author.id)
         if found is None:
@@ -1702,6 +1806,7 @@ class TTSCog(commands.Cog):
             )
             return
         guild_id, channel_id = found
+        text, _, _ = self._prepare_text(message.author.id, text, guild_id)
 
         bot_ch_id = self.voice_manager.current_channel_id(guild_id)
         if bot_ch_id is None:

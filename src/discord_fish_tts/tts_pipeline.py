@@ -257,7 +257,7 @@ class GuildTTSPipeline:
             prev = track
 
     async def _produce(self, job: TTSJob, track: Track) -> None:
-        voice_id = self._config_store.get_voice_for(job.user_id)
+        voice_id = self._config_store.get_voice_for(job.user_id, job.guild_id)
         track.voice_id = voice_id
         if not voice_id:
             track.error = RuntimeError("no voice configured; run /voice set <id> (or owner: /voice default <id>)")

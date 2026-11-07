@@ -123,6 +123,9 @@ def test_save_format(tmp_path: Path):
         "auto_tts_users": [],
         "auto_tts_channels": [1567826418329587783],
         "autocorrect_off_users": [],
+        "autocorrect_on_users": [],
+        "auto_tts_off_users": [],
+        "guild_settings": {},
     }
 
 

@@ -63,10 +63,13 @@ class ConfigStore:
         self._voice_id: str | None = None
         self._first_run_done: bool = False
         self._user_voices: dict[int, str] = {}
-        self._auto_tts_users: set[int] = set()
+        self._auto_tts_users: set[int] = set()       # chose auto-speak ON
+        self._auto_tts_off: set[int] = set()         # chose auto-speak OFF (unset = server default)
         self._auto_tts_channels: set[int] = set(default_auto_channels)
         self._enabled_guilds: set[int] = set()
-        self._autocorrect_off: set[int] = set()
+        self._autocorrect_off: set[int] = set()      # chose auto-correct OFF
+        self._autocorrect_on: set[int] = set()       # chose auto-correct ON (unset = server default)
+        self._guild_settings: dict[int, dict] = {}   # per-server /config values
         self._guild_gate_initialized = False
         self._load()
 
@@ -87,6 +90,7 @@ class ConfigStore:
             return False
         self._whitelist.discard(user_id)
         self._auto_tts_users.discard(user_id)
+        self._auto_tts_off.discard(user_id)
         self._save()
         return True
 
@@ -115,9 +119,11 @@ class ConfigStore:
             self._user_voices[user_id] = vid
         self._save()
 
-    def get_voice_for(self, user_id: int) -> str | None:
-        """The user's own voice, falling back to the default voice."""
-        return self._user_voices.get(user_id) or self._voice_id
+    def get_voice_for(self, user_id: int, guild_id: int | None = None) -> str | None:
+        """The user's own voice, else the server's default voice, else the global default."""
+        return (self._user_voices.get(user_id)
+                or (self.guild_default_voice(guild_id) if guild_id is not None else None)
+                or self._voice_id)
 
     # ---- SERVER pseudo-user ----
 
@@ -127,16 +133,29 @@ class ConfigStore:
     def set_server_voice(self, voice_id: str | None) -> None:
         self.set_user_voice(SERVER_USER_ID, voice_id)
 
-    # ---- auto-TTS (/toggle) ----
+    # ---- auto-TTS (/toggle): personal choice, else the server's default ----
 
-    def is_auto_tts(self, user_id: int) -> bool:
-        return user_id in self._auto_tts_users
+    def auto_tts_choice(self, user_id: int) -> bool | None:
+        if user_id in self._auto_tts_users:
+            return True
+        if user_id in self._auto_tts_off:
+            return False
+        return None
 
-    def set_auto_tts(self, user_id: int, enabled: bool) -> None:
-        if enabled:
+    def is_auto_tts(self, user_id: int, guild_id: int | None = None) -> bool:
+        choice = self.auto_tts_choice(user_id)
+        if choice is not None:
+            return choice
+        return bool(self.guild_setting(guild_id, "auto_speak_default", False)) if guild_id else False
+
+    def set_auto_tts(self, user_id: int, enabled: bool | None) -> None:
+        """True/False = personal choice everywhere; None = follow each server's default."""
+        self._auto_tts_users.discard(user_id)
+        self._auto_tts_off.discard(user_id)
+        if enabled is True:
             self._auto_tts_users.add(user_id)
-        else:
-            self._auto_tts_users.discard(user_id)
+        elif enabled is False:
+            self._auto_tts_off.add(user_id)
         self._save()
 
     def is_auto_tts_channel(self, channel_id: int) -> bool:
@@ -159,17 +178,53 @@ class ConfigStore:
         self._save()
         return True
 
-    # ---- auto-correct (on by default) ----
+    # ---- auto-correct: personal choice, else the server's default (on) ----
 
-    def is_autocorrect(self, user_id: int) -> bool:
-        return user_id not in self._autocorrect_off
+    def autocorrect_choice(self, user_id: int) -> bool | None:
+        if user_id in self._autocorrect_on:
+            return True
+        if user_id in self._autocorrect_off:
+            return False
+        return None
 
-    def set_autocorrect(self, user_id: int, enabled: bool) -> None:
-        if enabled:
-            self._autocorrect_off.discard(user_id)
-        else:
+    def is_autocorrect(self, user_id: int, guild_id: int | None = None) -> bool:
+        choice = self.autocorrect_choice(user_id)
+        if choice is not None:
+            return choice
+        return bool(self.guild_setting(guild_id, "autocorrect_default", True)) if guild_id else True
+
+    def set_autocorrect(self, user_id: int, enabled: bool | None) -> None:
+        self._autocorrect_on.discard(user_id)
+        self._autocorrect_off.discard(user_id)
+        if enabled is True:
+            self._autocorrect_on.add(user_id)
+        elif enabled is False:
             self._autocorrect_off.add(user_id)
         self._save()
+
+    # ---- per-server settings (/config) ----
+
+    def guild_setting(self, guild_id: int | None, key: str, default=None):
+        if guild_id is None:
+            return default
+        value = self._guild_settings.get(guild_id, {}).get(key)
+        return default if value is None else value
+
+    def set_guild_setting(self, guild_id: int, key: str, value) -> None:
+        settings = self._guild_settings.setdefault(guild_id, {})
+        if value is None:
+            settings.pop(key, None)
+        else:
+            settings[key] = value
+        if not settings:
+            self._guild_settings.pop(guild_id, None)
+        self._save()
+
+    def guild_default_voice(self, guild_id: int | None) -> str | None:
+        return self.guild_setting(guild_id, "default_voice")
+
+    def set_guild_default_voice(self, guild_id: int, voice_id: str | None) -> None:
+        self.set_guild_setting(guild_id, "default_voice", normalize_voice_id(voice_id))
 
     # ---- server gate (/enable, /disable) ----
 
@@ -252,6 +307,16 @@ class ConfigStore:
         if "auto_tts_channels" in data:
             self._auto_tts_channels = _int_set(data.get("auto_tts_channels"))
         self._autocorrect_off = _int_set(data.get("autocorrect_off_users"))
+        self._autocorrect_on = _int_set(data.get("autocorrect_on_users"))
+        self._auto_tts_off = _int_set(data.get("auto_tts_off_users"))
+        gs = data.get("guild_settings")
+        if isinstance(gs, dict):
+            for k, v in gs.items():
+                try:
+                    if isinstance(v, dict) and v:
+                        self._guild_settings[int(k)] = dict(v)
+                except (TypeError, ValueError):
+                    continue
         if "enabled_guilds" in data:
             self._enabled_guilds = _int_set(data.get("enabled_guilds"))
             self._guild_gate_initialized = True
@@ -264,8 +329,11 @@ class ConfigStore:
             "first_run_done": self._first_run_done,
             "user_voices": {str(k): v for k, v in sorted(self._user_voices.items())},
             "auto_tts_users": sorted(self._auto_tts_users),
+            "auto_tts_off_users": sorted(self._auto_tts_off),
             "auto_tts_channels": sorted(self._auto_tts_channels),
             "autocorrect_off_users": sorted(self._autocorrect_off),
+            "autocorrect_on_users": sorted(self._autocorrect_on),
+            "guild_settings": {str(k): v for k, v in sorted(self._guild_settings.items())},
         }
         if self._guild_gate_initialized:
             payload["enabled_guilds"] = sorted(self._enabled_guilds)

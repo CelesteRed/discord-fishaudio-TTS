@@ -87,7 +87,7 @@ async def test_commands_blocked_in_disabled_server(tmp_path: Path):
     assert "isn't enabled in this server" in it.response.send_message.await_args.args[0]
     assert await cog.interaction_check(_interaction(FRIEND, HOME, "say")) is True
     assert await cog.interaction_check(_interaction(FRIEND, None, "voice set")) is True  # DMs
-    assert await cog.interaction_check(_interaction(OWNER, NEW, "enable")) is True
+    assert await cog.interaction_check(_interaction(OWNER, NEW, "servers enable")) is True
     assert await cog.interaction_check(_interaction(OWNER, NEW, "say")) is False  # owner too, except mgmt
 
 
@@ -99,26 +99,26 @@ async def test_enable_and_disable_commands(tmp_path: Path):
     cog, _ = _cog(tmp_path, [_guild(HOME, "Home"), new])
     cog.registry.get_or_create.return_value.skip_current = AsyncMock()
 
-    it = _interaction(OWNER, None, "enable")
-    await cog.enable.callback(cog, it, server=str(NEW))
+    it = _interaction(OWNER, None, "servers enable")
+    await cog.servers_enable.callback(cog, it, server=str(NEW))
     assert cog.config.is_guild_enabled(NEW)
     assert "Enabled in **New Place**" in it.response.send_message.await_args.args[0]
 
-    it = _interaction(OWNER, None, "disable")
-    await cog.disable.callback(cog, it, server=str(NEW), leave=True)
+    it = _interaction(OWNER, None, "servers disable")
+    await cog.servers_disable.callback(cog, it, server=str(NEW), leave=True)
     assert not cog.config.is_guild_enabled(NEW)
     new.voice_client.disconnect.assert_awaited()
     new.leave.assert_awaited()
 
-    it = _interaction(FRIEND, None, "enable")
-    await cog.enable.callback(cog, it, server=str(HOME))
+    it = _interaction(FRIEND, None, "servers enable")
+    await cog.servers_enable.callback(cog, it, server=str(HOME))
     assert "Only the bot owner" in it.response.send_message.await_args.args[0]
 
 
 @pytest.mark.asyncio
 async def test_gate_autocomplete_offers_the_right_servers(tmp_path: Path):
     cog, _ = _cog(tmp_path, [_guild(HOME, "Home"), _guild(NEW, "New Place")])
-    owner = _interaction(OWNER, None, "enable")
+    owner = _interaction(OWNER, None, "servers enable")
     assert [c.value for c in await cog._enable_autocomplete(owner, "")] == [str(NEW)]
     assert [c.value for c in await cog._disable_autocomplete(owner, "")] == [str(HOME)]
 
@@ -136,7 +136,7 @@ async def test_join_dms_owner_once_including_offline_catch_up(tmp_path: Path):
     await cog.notify_unseen_guilds()  # restart: no repeat
     assert owner.send.await_count == 1
     embed = owner.send.await_args.kwargs["embed"]
-    assert "New Place" in embed.title and f"/enable server:{NEW}" in embed.description
+    assert "New Place" in embed.title and f"/servers enable server:{NEW}" in embed.description
 
 
 def test_dm_speech_prefers_server_where_bot_shares_the_channel(tmp_path: Path):
@@ -186,8 +186,8 @@ CMD_ONLY = 1533366845212721213
 @pytest.mark.asyncio
 async def test_enable_by_name_ignores_emoji_and_case(tmp_path: Path):
     cog, _ = _cog(tmp_path, [_guild(HOME, "Cosmiq Studio"), _guild(NEW, "🎃 Cosmiq")])
-    it = _interaction(OWNER, None, "enable")
-    await cog.enable.callback(cog, it, server="cosmiq")     # exact folded match wins over "Cosmiq Studio"
+    it = _interaction(OWNER, None, "servers enable")
+    await cog.servers_enable.callback(cog, it, server="cosmiq")     # exact folded match wins over "Cosmiq Studio"
     assert cog.config.is_guild_enabled(NEW)
     assert "Enabled in **🎃 Cosmiq** (`2222222222222222222`)" in it.response.send_message.await_args.args[0]
 
@@ -195,8 +195,8 @@ async def test_enable_by_name_ignores_emoji_and_case(tmp_path: Path):
 @pytest.mark.asyncio
 async def test_ambiguous_name_lists_candidates(tmp_path: Path):
     cog, _ = _cog(tmp_path, [_guild(HOME, "Cosmiq Studio"), _guild(NEW, "Cosmiq Lounge")])
-    it = _interaction(OWNER, None, "enable")
-    await cog.enable.callback(cog, it, server="cosmiq")
+    it = _interaction(OWNER, None, "servers enable")
+    await cog.servers_enable.callback(cog, it, server="cosmiq")
     msg = it.response.send_message.await_args.args[0]
     assert "Several servers match" in msg and "Cosmiq Lounge" in msg and "Cosmiq Studio" in msg
 
@@ -213,7 +213,7 @@ async def test_commands_only_server_is_detected_and_explained(tmp_path: Path):
     owner = _interaction(OWNER, CMD_ONLY, "say")
     assert await cog.interaction_check(owner) is False
     assert f"guild_id={CMD_ONLY}" in owner.response.send_message.await_args.args[0]
-    assert await cog.interaction_check(_interaction(OWNER, CMD_ONLY, "enable")) is True
+    assert await cog.interaction_check(_interaction(OWNER, CMD_ONLY, "servers enable")) is True
 
 
 @pytest.mark.asyncio
@@ -221,8 +221,8 @@ async def test_enable_commands_only_id_pre_enables_with_invite(tmp_path: Path):
     cog, _ = _cog(tmp_path, [_guild(HOME, "Home")])
     cog.bot.application_id = 4242
     cog._note_commands_only(CMD_ONLY)
-    it = _interaction(OWNER, None, "enable")
-    await cog.enable.callback(cog, it, server=str(CMD_ONLY))
+    it = _interaction(OWNER, None, "servers enable")
+    await cog.servers_enable.callback(cog, it, server=str(CMD_ONLY))
     msg = it.response.send_message.await_args.args[0]
     assert cog.config.is_guild_enabled(CMD_ONLY)
     assert "Pre-enabled" in msg and "scope=bot+applications.commands" in msg and f"guild_id={CMD_ONLY}" in msg
@@ -232,8 +232,8 @@ async def test_enable_commands_only_id_pre_enables_with_invite(tmp_path: Path):
 async def test_unknown_server_lists_servers_and_invite(tmp_path: Path):
     cog, _ = _cog(tmp_path, [_guild(HOME, "Home")])
     cog.bot.application_id = 4242
-    it = _interaction(OWNER, None, "enable")
-    await cog.enable.callback(cog, it, server="9999999999999999999")
+    it = _interaction(OWNER, None, "servers enable")
+    await cog.servers_enable.callback(cog, it, server="9999999999999999999")
     msg = it.response.send_message.await_args.args[0]
     assert "not in a server matching" in msg and "**Home**" in msg and "scope=bot" in msg
 
@@ -247,9 +247,9 @@ async def test_servers_shows_enabled_disabled_and_commands_only(tmp_path: Path):
     cog, _ = _cog(tmp_path, [home, new])
     cog.bot.application_id = 4242
     cog._note_commands_only(CMD_ONLY)
-    it = _interaction(OWNER, None, "servers")
-    await cog.servers.callback(cog, it)
+    it = _interaction(OWNER, None, "servers list")
+    await cog.servers_list.callback(cog, it)
     d = it.response.send_message.await_args.kwargs["embed"].description
     assert "**✅ Enabled (1)**" in d and "**Home**" in d
-    assert "**⛔ Not enabled (1)**" in d and "**New Place**" in d and f"/enable server:{NEW}" in d
+    assert "**⛔ Not enabled (1)**" in d and "**New Place**" in d and f"/servers enable server:{NEW}" in d
     assert "Commands only" in d and str(CMD_ONLY) in d
