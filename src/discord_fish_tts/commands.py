@@ -45,7 +45,15 @@ _SPOILER_RE = re.compile(r"\|\|.+?\|\|", re.S)
 VOICE_LIBRARY_URL = "https://fish.audio/app/discovery"
 DM_STATS_WORDS = {"stats", "view", "usage"}
 HARD_TEXT_LIMIT = 2000  # never speak more than this per message (~2 min)
-TOGGLE_REMINDER_COOLDOWN_S = 3600  # "auto-speak is off" reminder, per user
+TOGGLE_REMINDER_COOLDOWN_S = 3600
+# View Channels, Send Messages, Embed Links, Read Message History, Add Reactions,
+# View Audit Log (who added the bot), Connect, Speak
+BOT_INVITE_PERMISSIONS = 1024 | 2048 | 16384 | 65536 | 64 | 128 | 1048576 | 2097152
+
+
+def _fold(name: str) -> str:
+    """Server-name matching that ignores case, emoji and punctuation."""
+    return " ".join("".join(c.lower() if c.isalnum() else " " for c in name).split())  # "auto-speak is off" reminder, per user
 # Owner commands that still work inside a server that isn't enabled yet.
 GATE_EXEMPT_COMMANDS = {"enable", "disable", "servers", "view"}
 OWNER_HANDLE = "@CelesteRed"
@@ -966,13 +974,56 @@ class TTSCog(commands.Cog):
         return (f"⛔ **{self._bot_name()}** isn't enabled in this server yet. "
                 f"Ask {who} to enable it.")
 
+    # -- "commands only" servers: installed without the bot scope, so the bot
+    #    isn't a member (can't see the server or join voice), but its slash
+    #    commands still show up there. --
+
+    def invite_url(self, guild_id: int | None = None) -> str:
+        app_id = self.bot.application_id or (self.bot.user.id if self.bot.user else 0)
+        url = (f"https://discord.com/oauth2/authorize?client_id={app_id}"
+               f"&scope=bot+applications.commands&permissions={BOT_INVITE_PERMISSIONS}")
+        return url + (f"&guild_id={guild_id}&disable_guild_select=true" if guild_id else "")
+
+    def _commands_only_guilds(self) -> dict[int, float]:
+        """guild id -> last time someone used a command there while the bot isn't a member."""
+        store = self._usage_store
+        raw = store.get_meta("commands_only_guilds") if store is not None else None
+        seen = {int(k): v for k, v in json.loads(raw).items()} if raw else {}
+        return {gid: ts for gid, ts in seen.items() if self.bot.get_guild(gid) is None}
+
+    def _note_commands_only(self, guild_id: int) -> None:
+        store = self._usage_store
+        if store is None:
+            return
+        seen = self._commands_only_guilds()
+        seen[guild_id] = time.time()
+        store.set_meta("commands_only_guilds", json.dumps({str(k): v for k, v in seen.items()}))
+
+    def _commands_only_message(self, guild_id: int, for_owner: bool) -> str:
+        msg = (f"⚠️ **{self._bot_name()}** was added here with **commands only**, not as a bot, so I'm not "
+               "actually in this server and can't join voice.")
+        if for_owner:
+            return msg + f"\nAdd me properly (picks this server automatically): <{self.invite_url(guild_id)}>"
+        oid = self._owner_id()
+        who = f"<@{oid}> ({OWNER_HANDLE})" if oid else OWNER_HANDLE
+        return msg + f" Ask {who} to add me."
+
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         """Runs before every slash command in this cog."""
         gid = interaction.guild_id
+        root = interaction.command.qualified_name.split()[0] if interaction.command else ""
+        owner_mgmt = root in GATE_EXEMPT_COMMANDS and self._is_owner(interaction.user.id)
+        if gid is not None and self.bot.get_guild(gid) is None:
+            self._note_commands_only(gid)
+            if owner_mgmt:
+                return True
+            log.info("blocked /%s from %s in commands-only server %s", root, interaction.user, gid)
+            await interaction.response.send_message(
+                self._commands_only_message(gid, self._is_owner(interaction.user.id)), ephemeral=True)
+            return False
         if gid is None or self.config.is_guild_enabled(gid):
             return True
-        root = interaction.command.qualified_name.split()[0] if interaction.command else ""
-        if root in GATE_EXEMPT_COMMANDS and self._is_owner(interaction.user.id):
+        if owner_mgmt:
             return True
         log.info("blocked /%s from %s in disabled server %s", root, interaction.user, gid)
         await interaction.response.send_message(self._disabled_message(), ephemeral=True)
@@ -1056,8 +1107,12 @@ class TTSCog(commands.Cog):
         for g in self.bot.guilds:
             if self.config.is_guild_enabled(g.id) != want_enabled:
                 continue
-            if not cur or cur in g.name.lower() or cur in str(g.id):
+            if not cur or _fold(cur) in _fold(g.name) or cur in str(g.id):
                 out.append(app_commands.Choice(name=f"{g.name} ({g.id})"[:100], value=str(g.id)))
+        for gid in self._commands_only_guilds():
+            if self.config.is_guild_enabled(gid) == want_enabled and (not cur or cur in str(gid)):
+                out.append(app_commands.Choice(name=f"{gid} — commands only, needs a bot invite"[:100],
+                                               value=str(gid)))
         return out[:25]
 
     async def _enable_autocomplete(self, interaction: discord.Interaction, current: str):
@@ -1066,9 +1121,38 @@ class TTSCog(commands.Cog):
     async def _disable_autocomplete(self, interaction: discord.Interaction, current: str):
         return await self._gate_autocomplete(interaction, current, want_enabled=True)
 
-    def _resolve_guild(self, value: str) -> discord.Guild | None:
+    def _resolve_guild(self, value: str) -> tuple[discord.Guild | None, list[discord.Guild]]:
+        """(match, candidates). Accepts an ID or a server name; names are matched
+        ignoring case, emoji and punctuation, exact first, then partial."""
         gid = self._parse_id(value)
-        return self.bot.get_guild(gid) if gid else None
+        if gid:
+            return self.bot.get_guild(gid), []
+        want = _fold(value)
+        if not want:
+            return None, []
+        exact = [g for g in self.bot.guilds if _fold(g.name) == want]
+        partial = exact or [g for g in self.bot.guilds if want in _fold(g.name)]
+        return (partial[0], []) if len(partial) == 1 else (None, partial)
+
+    async def _gate_target(self, interaction: discord.Interaction, server: str) -> discord.Guild | int | None:
+        """Resolve /enable or /disable's server argument, replying when it can't."""
+        guild, candidates = self._resolve_guild(server)
+        if guild is not None:
+            return guild
+        gid = self._parse_id(server)
+        if candidates:
+            names = "\n".join(f"• **{g.name}** — `{g.id}`" for g in candidates[:10])
+            await interaction.response.send_message(f"Several servers match `{server}`:\n{names}\nUse the ID.",
+                                                    ephemeral=True)
+            return None
+        if gid is not None and (gid in self._commands_only_guilds() or gid == interaction.guild_id):
+            return gid  # commands-only server: handled by the caller
+        mine = "\n".join(f"• **{g.name}** — `{g.id}`" for g in self.bot.guilds) or "*(none)*"
+        await interaction.response.send_message(
+            f"I'm not in a server matching `{server}`.\n\n**Servers I'm in:**\n{mine}\n\n"
+            "If my commands show up in a server that isn't listed, I was added with *commands only*. "
+            f"Add me as a bot: <{self.invite_url(gid)}>", ephemeral=True)
+        return None
 
     @app_commands.command(name="enable", description="Allow the bot to be used in a server (owner only).")
     @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
@@ -1077,9 +1161,16 @@ class TTSCog(commands.Cog):
     async def enable(self, interaction: discord.Interaction, server: str) -> None:
         if await self._deny_if_not_owner(interaction):
             return
-        guild = self._resolve_guild(server)
+        guild = await self._gate_target(interaction, server)
         if guild is None:
-            await interaction.response.send_message(f"I'm not in a server matching `{server}`.", ephemeral=True)
+            return
+        if isinstance(guild, int):
+            self.config.enable_guild(guild)
+            log.info("commands-only server %s pre-enabled by owner", guild)
+            await interaction.response.send_message(
+                f"✅ Pre-enabled `{guild}`, but I'm not actually in that server: I was added with *commands "
+                "only*. Add me as a bot with this link (it picks the server for you) and I'll work there "
+                f"right away:\n<{self.invite_url(guild)}>", ephemeral=True)
             return
         changed = self.config.enable_guild(guild.id)
         log.info("server %s (%s) enabled by owner", guild.name, guild.id)
@@ -1094,9 +1185,13 @@ class TTSCog(commands.Cog):
     async def disable(self, interaction: discord.Interaction, server: str, leave: bool = False) -> None:
         if await self._deny_if_not_owner(interaction):
             return
-        guild = self._resolve_guild(server)
+        guild = await self._gate_target(interaction, server)
         if guild is None:
-            await interaction.response.send_message(f"I'm not in a server matching `{server}`.", ephemeral=True)
+            return
+        if isinstance(guild, int):
+            self.config.disable_guild(guild)
+            await interaction.response.send_message(
+                f"⛔ Disabled `{guild}` (I'm not a member there, so there's nothing to leave).", ephemeral=True)
             return
         self.config.disable_guild(guild.id)
         if guild.voice_client is not None:
@@ -1115,13 +1210,24 @@ class TTSCog(commands.Cog):
     async def servers(self, interaction: discord.Interaction) -> None:
         if await self._deny_if_not_owner(interaction):
             return
-        lines = []
-        for g in sorted(self.bot.guilds, key=lambda g: (not self.config.is_guild_enabled(g.id), g.name.lower())):
-            lines.append(f"**{g.name}** · `{g.id}`\n   {self._guild_status(g)}")
-        embed = discord.Embed(title=f"🌐 {self._bot_name()} is in {len(self.bot.guilds)} server(s)",
-                              description="\n".join(lines)[:4096] or "Not in any server.",
-                              color=discord.Color.blurple())
-        embed.set_footer(text="/enable server:… · /disable server:… [leave:True]")
+        guilds = self.bot.guilds
+        enabled = [g for g in guilds if self.config.is_guild_enabled(g.id)]
+        disabled = [g for g in guilds if not self.config.is_guild_enabled(g.id)]
+        parts = [f"**✅ Enabled ({len(enabled)})**\n" + ("\n".join(
+                     f"**{g.name}** · `{g.id}`\n   {self._guild_status(g)}" for g in sorted(enabled, key=lambda g: g.name.lower()))
+                     or "*none*"),
+                 f"**⛔ Not enabled ({len(disabled)})**\n" + ("\n".join(
+                     f"**{g.name}** · `{g.id}`\n   {self._guild_status(g)} · `/enable server:{g.id}`"
+                     for g in sorted(disabled, key=lambda g: g.name.lower())) or "*none*")]
+        cmd_only = self._commands_only_guilds()
+        if cmd_only:
+            parts.append(f"**⚠️ Commands only — not a member ({len(cmd_only)})**\n" + "\n".join(
+                f"`{gid}` · {'pre-enabled' if self.config.is_guild_enabled(gid) else 'not enabled'}"
+                f" · last used <t:{int(ts)}:R> · [add as bot]({self.invite_url(gid)})"
+                for gid, ts in sorted(cmd_only.items(), key=lambda kv: -kv[1])))
+        embed = discord.Embed(title=f"🌐 {self._bot_name()} is in {len(guilds)} server(s)",
+                              description="\n\n".join(parts)[:4096], color=discord.Color.blurple())
+        embed.set_footer(text="/enable server:<name or ID> · /disable server:… [leave:True]")
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     # ---- /stop and /queue ----

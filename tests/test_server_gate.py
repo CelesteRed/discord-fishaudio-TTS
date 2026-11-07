@@ -176,3 +176,80 @@ def test_server_announcements_skip_disabled_servers(tmp_path: Path):
     bot = MagicMock(guilds=[home, new])
     n = ServerNotifier(bot, MagicMock(), cfg, lambda: OWNER, "k", "s2.1-pro-free")
     assert [t[0] for t in n.voice_targets()] == [HOME]
+
+
+# ---- commands-only servers + name matching ----
+
+CMD_ONLY = 1533366845212721213
+
+
+@pytest.mark.asyncio
+async def test_enable_by_name_ignores_emoji_and_case(tmp_path: Path):
+    cog, _ = _cog(tmp_path, [_guild(HOME, "Cosmiq Studio"), _guild(NEW, "🎃 Cosmiq")])
+    it = _interaction(OWNER, None, "enable")
+    await cog.enable.callback(cog, it, server="cosmiq")     # exact folded match wins over "Cosmiq Studio"
+    assert cog.config.is_guild_enabled(NEW)
+    assert "Enabled in **🎃 Cosmiq** (`2222222222222222222`)" in it.response.send_message.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_name_lists_candidates(tmp_path: Path):
+    cog, _ = _cog(tmp_path, [_guild(HOME, "Cosmiq Studio"), _guild(NEW, "Cosmiq Lounge")])
+    it = _interaction(OWNER, None, "enable")
+    await cog.enable.callback(cog, it, server="cosmiq")
+    msg = it.response.send_message.await_args.args[0]
+    assert "Several servers match" in msg and "Cosmiq Lounge" in msg and "Cosmiq Studio" in msg
+
+
+@pytest.mark.asyncio
+async def test_commands_only_server_is_detected_and_explained(tmp_path: Path):
+    cog, _ = _cog(tmp_path, [_guild(HOME, "Home")])
+    cog.bot.application_id = 4242
+    friend = _interaction(FRIEND, CMD_ONLY, "say")
+    assert await cog.interaction_check(friend) is False
+    assert "commands only" in friend.response.send_message.await_args.args[0]
+    assert "client_id" not in friend.response.send_message.await_args.args[0]   # link is owner-only
+    assert CMD_ONLY in cog._commands_only_guilds()
+    owner = _interaction(OWNER, CMD_ONLY, "say")
+    assert await cog.interaction_check(owner) is False
+    assert f"guild_id={CMD_ONLY}" in owner.response.send_message.await_args.args[0]
+    assert await cog.interaction_check(_interaction(OWNER, CMD_ONLY, "enable")) is True
+
+
+@pytest.mark.asyncio
+async def test_enable_commands_only_id_pre_enables_with_invite(tmp_path: Path):
+    cog, _ = _cog(tmp_path, [_guild(HOME, "Home")])
+    cog.bot.application_id = 4242
+    cog._note_commands_only(CMD_ONLY)
+    it = _interaction(OWNER, None, "enable")
+    await cog.enable.callback(cog, it, server=str(CMD_ONLY))
+    msg = it.response.send_message.await_args.args[0]
+    assert cog.config.is_guild_enabled(CMD_ONLY)
+    assert "Pre-enabled" in msg and "scope=bot+applications.commands" in msg and f"guild_id={CMD_ONLY}" in msg
+
+
+@pytest.mark.asyncio
+async def test_unknown_server_lists_servers_and_invite(tmp_path: Path):
+    cog, _ = _cog(tmp_path, [_guild(HOME, "Home")])
+    cog.bot.application_id = 4242
+    it = _interaction(OWNER, None, "enable")
+    await cog.enable.callback(cog, it, server="9999999999999999999")
+    msg = it.response.send_message.await_args.args[0]
+    assert "not in a server matching" in msg and "**Home**" in msg and "scope=bot" in msg
+
+
+@pytest.mark.asyncio
+async def test_servers_shows_enabled_disabled_and_commands_only(tmp_path: Path):
+    home, new = _guild(HOME, "Home"), _guild(NEW, "New Place")
+    for g in (home, new):
+        g.voice_client = None
+        g.get_channel = lambda cid: None
+    cog, _ = _cog(tmp_path, [home, new])
+    cog.bot.application_id = 4242
+    cog._note_commands_only(CMD_ONLY)
+    it = _interaction(OWNER, None, "servers")
+    await cog.servers.callback(cog, it)
+    d = it.response.send_message.await_args.kwargs["embed"].description
+    assert "**✅ Enabled (1)**" in d and "**Home**" in d
+    assert "**⛔ Not enabled (1)**" in d and "**New Place**" in d and f"/enable server:{NEW}" in d
+    assert "Commands only" in d and str(CMD_ONLY) in d
