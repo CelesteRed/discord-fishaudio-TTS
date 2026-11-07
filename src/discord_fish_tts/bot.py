@@ -99,7 +99,7 @@ async def amain() -> None:
         model=os.environ.get("FISH_MODEL", "s2-pro"),
         latency=os.environ.get("FISH_LATENCY", "low"),
     )
-    max_text_len = int(os.environ.get("MAX_TEXT_LEN", "200"))
+    max_text_len = int(os.environ.get("MAX_TEXT_LEN", "2000"))
     # Auto-leave voice when alone for N minutes. 0 disables.
     idle_timeout_s = int(os.environ.get("IDLE_TIMEOUT_MINUTES", "5")) * 60
 

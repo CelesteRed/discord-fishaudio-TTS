@@ -29,7 +29,7 @@ class Track:
     """One message being spoken. Frames are pushed from the event loop (producer)
     and pulled by the mixer on discord.py's player thread."""
 
-    def __init__(self, job=None, max_buffer: int = 3000) -> None:
+    def __init__(self, job=None, max_buffer: int = 9000) -> None:
         self.id = next(_ids)
         self.job = job
         self._q: _queue.Queue[bytes | None] = _queue.Queue(maxsize=max_buffer)

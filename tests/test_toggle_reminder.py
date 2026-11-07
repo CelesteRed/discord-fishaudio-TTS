@@ -144,3 +144,29 @@ async def test_toggle_on_off_argument(tmp_path: Path, clock):
     for state, expected in (("on", True), ("on", True), ("off", False), (None, True)):
         await cog.toggle.callback(cog, it, state=state)
         assert cog.config.is_auto_tts(FRIEND) is expected
+
+
+@pytest.mark.asyncio
+async def test_long_auto_speak_message_is_spoken_whole_and_cut_ones_get_scissors(tmp_path: Path, clock):
+    cog, _ = _cog(tmp_path)
+    cog.config.set_auto_tts(FRIEND, True)
+    cog.max_text_len = 2000
+    cog.voice_manager.current_channel_id.return_value = 77
+    story = ("Crimson Forge! A four meter radius where anyone who enters gets burnt to a crisp. " * 11).strip()
+    assert 900 < len(story) < 2000
+    m = _msg(FRIEND, content=story)
+    m.clean_content = story
+    m.author.voice.channel.id = 77
+    m.add_reaction = AsyncMock()
+    await cog._handle_auto_tts(m)
+    job = cog.registry.get_or_create.return_value.enqueue.await_args.args[0]
+    assert job.text == story
+    m.add_reaction.assert_not_awaited()
+    cog.max_text_len = 200
+    m2 = _msg(FRIEND, content=story)
+    m2.clean_content = story
+    m2.author.voice.channel.id = 77
+    m2.add_reaction = AsyncMock()
+    await cog._handle_auto_tts(m2)
+    assert len(cog.registry.get_or_create.return_value.enqueue.await_args.args[0].text) <= 200
+    m2.add_reaction.assert_awaited_once_with("✂️")

@@ -32,7 +32,7 @@ from .voice_manager import VoiceManager
 log = logging.getLogger(__name__)
 
 QUEUE_MAXSIZE_DEFAULT = 20
-PLAY_TIMEOUT_S = 120
+PLAY_TIMEOUT_S = 240  # a 2000-character message is ~2 min of speech
 DAVE_READY_TIMEOUT_S = 5.0
 
 CROSS_USER_WINDOW_S = 10.0   # other person replying this soon may talk over the end

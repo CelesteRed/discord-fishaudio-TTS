@@ -278,3 +278,15 @@ async def test_missing_voice_reports_error(tmp_path):
     await drain(p)
     await p.stop()
     assert errors and "no voice" in str(errors[0]) and vc.plays == 0
+
+
+@pytest.mark.asyncio
+async def test_long_message_plays_to_the_end(tmp_path):
+    """A ~70 s line (longer than the old 60 s buffer) must not be cut short."""
+    p, vc, usage = make_pipeline(tmp_path, seconds_per_job=70.0)
+    vc.tick = 0.0003
+    await p.start()
+    await p.enqueue(TTSJob("long story", 1, 1, 1))
+    await drain(p, timeout=30)
+    await p.stop()
+    assert usage[0][2] == 70_000 and usage[0][3] is False

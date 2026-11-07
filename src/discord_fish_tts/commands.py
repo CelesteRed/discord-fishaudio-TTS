@@ -10,6 +10,7 @@ Authorization model:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import re
@@ -43,6 +44,7 @@ _SPOILER_RE = re.compile(r"\|\|.+?\|\|", re.S)
 
 VOICE_LIBRARY_URL = "https://fish.audio/app/discovery"
 DM_STATS_WORDS = {"stats", "view", "usage"}
+HARD_TEXT_LIMIT = 2000  # never speak more than this per message (~2 min)
 TOGGLE_REMINDER_COOLDOWN_S = 3600  # "auto-speak is off" reminder, per user
 # Owner commands that still work inside a server that isn't enabled yet.
 GATE_EXEMPT_COMMANDS = {"enable", "disable", "servers", "view"}
@@ -259,14 +261,14 @@ class TTSCog(commands.Cog):
             except Exception:
                 log.exception("auto-correct failed; speaking the original text")
         text, used = apply_shortcuts(text, shortcuts)
-        limit = self.max_text_len * 2  # shortcuts may expand a message
+        limit = min(self.max_text_len * 2, HARD_TEXT_LIMIT)  # shortcuts may expand a message
         if len(text) > limit:
             cut = text[:limit]
             text = cut.rsplit(" ", 1)[0] if " " in cut[limit // 2:] else cut
         return text, fixes, used
 
     @app_commands.command(name="say", description="Speak text in the bot's current voice channel.")
-    @app_commands.describe(text="Text to speak (max 200 chars)")
+    @app_commands.describe(text="Text to speak")
     async def say(self, interaction: discord.Interaction, text: str) -> None:
         log.info("/say from %s in guild %s: %r", interaction.user, interaction.guild_id, text[:60])
         try:
@@ -1449,6 +1451,10 @@ class TTSCog(commands.Cog):
         text = speakable_text(message.clean_content, self.max_text_len)
         if not text:
             return
+        if len(" ".join(message.clean_content.split())) > self.max_text_len:
+            # Tell them it was cut instead of silently stopping mid-sentence.
+            with contextlib.suppress(discord.HTTPException):
+                await message.add_reaction("✂️")
         text, _, _ = self._prepare_text(member.id, text)
 
         guild = message.guild
